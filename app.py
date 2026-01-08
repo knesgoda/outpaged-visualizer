@@ -13,6 +13,44 @@ import stability_sdk.interfaces.gooseai.generation.generation_pb2 as generation
 
 
 # =========================
+# Auth
+# =========================
+
+def _require_auth():
+    """
+    If APP_PASSWORD exists in secrets, gate the app behind a simple unlock screen.
+    Uses a form + st.rerun() so Streamlit reruns do not break unlocking.
+    """
+    app_pw = st.secrets.get("APP_PASSWORD", "")
+    app_pw = (app_pw or "").strip()
+
+    # No password set means no lock
+    if not app_pw:
+        return
+
+    if "authed" not in st.session_state:
+        st.session_state["authed"] = False
+
+    if st.session_state["authed"]:
+        return
+
+    st.subheader("🔒 Locked")
+
+    with st.form("unlock_form", clear_on_submit=False):
+        pw = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Unlock")
+
+    if submitted:
+        if (pw or "").strip() == app_pw:
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password. Check Streamlit Secrets for APP_PASSWORD.")
+
+    st.stop()
+
+
+# =========================
 # Helpers
 # =========================
 
@@ -28,7 +66,7 @@ def _get_cfg() -> Tuple[str, str, str]:
 
 @st.cache_resource(show_spinner=False)
 def _get_stability_client(host: str, key: str, engine: str) -> client.StabilityInference:
-    # Stability SDK reads these env vars internally too.
+    # Stability SDK reads these env vars internally too
     os.environ["STABILITY_HOST"] = host
     os.environ["STABILITY_KEY"] = key
 
@@ -40,10 +78,30 @@ def _get_stability_client(host: str, key: str, engine: str) -> client.StabilityI
 
 
 def _build_weighted_prompts(prompt_text: str, negative_text: str) -> List[generation.Prompt]:
-    prompts = [generation.Prompt(text=prompt_text, weight=1.0)]
-    neg = (negative_text or "").strip()
+    """
+    stability-sdk uses PromptParameters(weight=...) rather than Prompt(weight=...).
+    Negative prompt can be represented as weight -1.0.
+    """
+    prompt_text = str(prompt_text or "").strip()
+    if not prompt_text:
+        raise ValueError("Prompt is empty.")
+
+    prompts = [
+        generation.Prompt(
+            text=prompt_text,
+            parameters=generation.PromptParameters(weight=1.0),
+        )
+    ]
+
+    neg = str(negative_text or "").strip()
     if neg:
-        prompts.append(generation.Prompt(text=neg, weight=-1.0))
+        prompts.append(
+            generation.Prompt(
+                text=neg,
+                parameters=generation.PromptParameters(weight=-1.0),
+            )
+        )
+
     return prompts
 
 
@@ -60,7 +118,6 @@ def _generate_images(
 ) -> List[Tuple[Image.Image, Optional[int]]]:
     """
     Returns list of (PIL Image, seed).
-    Uses weighted prompts to support negative prompts without negative_prompt=.
     """
     prompts = _build_weighted_prompts(prompt_text, negative_text)
 
@@ -112,18 +169,11 @@ def _zip_bytes(named_pngs: List[Tuple[str, bytes]]) -> bytes:
 
 BACKGROUND_BLOCK_RE = re.compile(
     r"Background file name:\s*(?P<fname>\S+)\s*\n(?P<prompt>.*?)(?=\n\s*\nScene\s+\d+|\n\s*\nCanonical|\Z)",
-    re.IGNORECASE | re.DOTALL
+    re.IGNORECASE | re.DOTALL,
 )
 
 
 def _parse_background_doc(text: str) -> List[Dict[str, str]]:
-    """
-    Extracts:
-      - file_name from "Background file name:"
-      - prompt from the text that follows until next Scene / Canonical / EOF
-
-    Returns list of {file_name, prompt, label}.
-    """
     items: List[Dict[str, str]] = []
     if not (text or "").strip():
         return items
@@ -132,11 +182,9 @@ def _parse_background_doc(text: str) -> List[Dict[str, str]]:
         fname = m.group("fname").strip()
         prompt = m.group("prompt").strip()
 
-        # Light cleanup: collapse internal whitespace
         prompt = re.sub(r"[ \t]+\n", "\n", prompt)
         prompt = re.sub(r"\n{3,}", "\n\n", prompt)
 
-        # Try to capture a nearby scene label by searching backwards a bit
         start = max(0, m.start() - 250)
         context = text[start:m.start()]
         scene_label = ""
@@ -148,23 +196,6 @@ def _parse_background_doc(text: str) -> List[Dict[str, str]]:
         items.append({"file_name": fname, "prompt": prompt, "label": label})
 
     return items
-
-
-def _require_auth():
-    app_pw = st.secrets.get("APP_PASSWORD", "").strip()
-    if not app_pw:
-        return
-
-    if "authed" not in st.session_state:
-        st.session_state["authed"] = False
-
-    if not st.session_state["authed"]:
-        st.subheader("🔒 Locked")
-        pw = st.text_input("Password", type="password")
-        if st.button("Unlock"):
-            st.session_state["authed"] = (pw == app_pw)
-        if not st.session_state["authed"]:
-            st.stop()
 
 
 # =========================
@@ -190,7 +221,7 @@ with st.sidebar:
     style_preset = st.selectbox(
         "Style preset",
         ["cinematic", "fantasy-art", "photographic", "comic-book"],
-        index=0
+        index=0,
     )
 
     steps = st.slider("Steps", 10, 50, 30)
@@ -199,7 +230,7 @@ with st.sidebar:
     size_mode = st.selectbox(
         "Output size",
         ["Background 16:9 (1024x576)", "Square (1024x1024)", "Portrait (768x1024)"],
-        index=0
+        index=0,
     )
 
     if size_mode == "Background 16:9 (1024x576)":
@@ -213,9 +244,8 @@ with st.sidebar:
     negative_prompt = st.text_area(
         "Negative prompt (optional)",
         value="blurry, low detail, watermark, text, logo, extra limbs, bad anatomy",
-        height=90
+        height=90,
     )
-
 
 tab_bg, tab_char = st.tabs(["Backgrounds", "Characters"])
 
@@ -236,7 +266,7 @@ with tab_bg:
         parse_btn = st.button("Parse backgrounds", type="secondary")
 
         parsed_items: List[Dict[str, str]] = []
-        if parse_btn or ("bg_items" in st.session_state and not bg_text.strip() == ""):
+        if parse_btn:
             parsed_items = _parse_background_doc(bg_text)
             st.session_state["bg_items"] = parsed_items
 
@@ -254,7 +284,7 @@ with tab_bg:
             preview_prompt = st.text_area(
                 "Manual background prompt",
                 value="Rocky coastline after a violent storm... Style: vivid chalk pastel illustration...",
-                height=140
+                height=140,
             )
             file_base = st.text_input("File base (used for naming)", value="bg_preview")
 
@@ -289,7 +319,7 @@ with tab_bg:
                     "Download preview PNG",
                     data=png,
                     file_name=f"{file_base}_preview.png",
-                    mime="image/png"
+                    mime="image/png",
                 )
 
     st.divider()
@@ -338,7 +368,7 @@ with tab_bg:
                         data=data,
                         file_name=name,
                         mime="image/png",
-                        key=f"dl_bg_{name}_{seed}_{i}"
+                        key=f"dl_bg_{name}_{seed}_{i}",
                     )
 
             z = _zip_bytes(zip_payload)
@@ -346,7 +376,7 @@ with tab_bg:
                 "Download ALL as ZIP",
                 data=z,
                 file_name=f"{prefix}_batch.zip",
-                mime="application/zip"
+                mime="application/zip",
             )
 
 
@@ -355,8 +385,7 @@ with tab_bg:
 # =========================
 with tab_char:
     st.subheader("Character training set generator")
-
-    st.write("This generates: 1 full-body neutral + 3 face angles (front, 45°, profile).")
+    st.write("Generates: 1 neutral full-body + 3 face angles (front, 45°, profile).")
 
     char_col1, char_col2 = st.columns([1, 1])
 
@@ -370,12 +399,11 @@ with tab_char:
             value=(
                 "Lemuel Gulliver, an English ship’s surgeon and seasoned traveler in the early 1700s, "
                 "lean build and weathered seafarer’s face, medium-length dark hair, clean-shaven or faint stubble, "
-                "wearing period-accurate voyager clothing: dark long coat, waistcoat, linen shirt, neck cloth, "
-                "breeches, stockings, buckled shoes, with a leather satchel and nautical wear and tear appropriate "
-                "to harsh voyages. Realistic charcoal drawing with subtle colored chalk accents (muted blues, reds, ochres), "
-                "textured paper grain, high detail, lifelike eyes and shading, slightly glossy highlights, full body cutout, "
-                "no background, no shadow, no text."
-            )
+                "wearing period-accurate voyager clothing: dark long coat, waistcoat, linen shirt, neck cloth, breeches, "
+                "stockings, buckled shoes, with a leather satchel and nautical wear and tear appropriate to harsh voyages. "
+                "Realistic charcoal drawing with subtle colored chalk accents (muted blues, reds, ochres), textured paper grain, "
+                "high detail, lifelike eyes and shading, slightly glossy highlights, full body cutout, no background, no shadow, no text."
+            ),
         )
 
     with char_col2:
@@ -412,7 +440,7 @@ with tab_char:
                     data=data,
                     file_name=f"{_slugify(char_file_base)}_neutral_full_preview.png",
                     mime="image/png",
-                    key="dl_char_preview"
+                    key="dl_char_preview",
                 )
             else:
                 st.error("No image returned. Try adjusting prompt or settings.")
@@ -465,7 +493,7 @@ with tab_char:
                         data=data,
                         file_name=fname,
                         mime="image/png",
-                        key=f"dl_{fname}_{seed}_{idx}"
+                        key=f"dl_{fname}_{seed}_{idx}",
                     )
 
         if out_files:
@@ -475,5 +503,5 @@ with tab_char:
                 data=z,
                 file_name=f"{base}_training_set.zip",
                 mime="application/zip",
-                key="dl_training_zip"
+                key="dl_training_zip",
             )
