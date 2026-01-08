@@ -1,0 +1,8 @@
+streamlit
+Pillow
+python-docx
+stability-sdk
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
