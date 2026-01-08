@@ -246,28 +246,33 @@ if not api_key:
     )
     st.stop()
 
-# Sidebar settings
+# Sidebar settings (add keys everywhere to avoid duplicates)
 with st.sidebar:
     st.header("Settings")
 
-    model_choice = st.selectbox("Model", list(ENDPOINTS.keys()), index=0)
+    model_choice = st.selectbox("Model", list(ENDPOINTS.keys()), index=0, key="sb_model")
     endpoint_path = ENDPOINTS[model_choice]
 
-    aspect_ratio = st.selectbox("Aspect ratio", ASPECT_RATIOS, index=0)
-    output_format = st.selectbox("Output format", OUTPUT_FORMATS, index=0)
+    aspect_ratio = st.selectbox("Aspect ratio", ASPECT_RATIOS, index=0, key="sb_aspect")
+    output_format = st.selectbox("Output format", OUTPUT_FORMATS, index=0, key="sb_format")
 
-    variants_per_prompt = st.slider("Variants per prompt", 1, 5, 1)
+    variants_per_prompt = st.slider("Variants per prompt", 1, 5, 1, key="sb_variants")
 
-    seed_mode = st.selectbox("Seed mode", ["Fixed (more consistent)", "Random"], index=0)
-    fixed_seed = st.number_input("Seed", min_value=0, max_value=2_147_483_647, value=123456, step=1) if seed_mode.startswith("Fixed") else None
+    seed_mode = st.selectbox("Seed mode", ["Fixed (more consistent)", "Random"], index=0, key="sb_seed_mode")
+    fixed_seed = (
+        st.number_input("Seed", min_value=0, max_value=2_147_483_647, value=123456, step=1, key="sb_seed")
+        if seed_mode.startswith("Fixed")
+        else None
+    )
 
     st.divider()
     st.subheader("Reference image (optional)")
-    ref_img = st.file_uploader("Upload reference image", type=["png", "jpg", "jpeg"])
+    ref_img = st.file_uploader("Upload reference image", type=["png", "jpg", "jpeg"], key="sb_ref_img")
     strength = st.slider(
         "Strength (only used if reference image provided)",
         0.05, 0.95, 0.35, 0.05,
-        help="Lower = closer to reference. Higher = more reimagined."
+        help="Lower = closer to reference. Higher = more reimagined.",
+        key="sb_strength",
     )
 
     st.divider()
@@ -276,10 +281,19 @@ with st.sidebar:
         "Negative prompt",
         value="text, watermark, logo, signature, low quality, blurry, extra limbs, malformed",
         height=100,
+        key="sb_negative",
     )
 
 # Tabs
 tab_doc, tab_single = st.tabs(["Batch from Doc (Scenes)", "Single Prompt"])
+
+# Read reference bytes once per run (important: file_uploader returns a file-like object)
+ref_bytes = None
+if ref_img is not None:
+    try:
+        ref_bytes = ref_img.read()
+    except Exception:
+        ref_bytes = None
 
 # ===== TAB: DOC BATCH =====
 with tab_doc:
@@ -297,7 +311,6 @@ with tab_doc:
         else:
             st.success(f"Found {len(items)} scenes (background prompts).")
 
-            # selection defaults to ALL scenes
             all_keys = [it.file_base for it in items]
 
             if "selected_scene_keys" not in st.session_state:
@@ -305,38 +318,34 @@ with tab_doc:
 
             col1, col2, col3 = st.columns([1, 1, 2])
             with col1:
-                if st.button("Select all", use_container_width=True):
+                if st.button("Select all", use_container_width=True, key="doc_select_all"):
                     st.session_state["selected_scene_keys"] = all_keys
             with col2:
-                if st.button("Select none", use_container_width=True):
+                if st.button("Select none", use_container_width=True, key="doc_select_none"):
                     st.session_state["selected_scene_keys"] = []
 
             selected = st.multiselect(
                 "Scenes to generate",
                 options=all_keys,
                 default=st.session_state["selected_scene_keys"],
+                key="doc_scene_multiselect",
             )
             st.session_state["selected_scene_keys"] = selected
 
             total_outputs = len(selected) * int(variants_per_prompt)
             st.info(f"Outputs to generate: {len(selected)} scenes × {variants_per_prompt} variants = {total_outputs} images")
 
-            # Preview picker
             selected_items = [it for it in items if it.file_base in selected]
             preview_options = [it.file_base for it in selected_items] if selected_items else all_keys
-            preview_key = st.selectbox("Preview which scene?", options=preview_options)
+            preview_key = st.selectbox("Preview which scene?", options=preview_options, key="doc_preview_scene")
 
             preview_item = next(it for it in items if it.file_base == preview_key)
 
             cA, cB = st.columns([1, 1])
             with cA:
-                preview_btn = st.button("Preview 1", type="secondary", use_container_width=True)
+                preview_btn = st.button("Preview 1", type="secondary", use_container_width=True, key="doc_preview_btn")
             with cB:
-                gen_btn = st.button("Generate full batch", type="primary", use_container_width=True)
-
-            ref_bytes = None
-            if ref_img is not None:
-                ref_bytes = ref_img.read()
+                gen_btn = st.button("Generate full batch", type="primary", use_container_width=True, key="doc_generate_btn")
 
             if preview_btn:
                 try:
@@ -356,6 +365,7 @@ with tab_doc:
                         caption=f"{preview_item.file_base}.{output_format}",
                         use_container_width=True,
                     )
+                    st.caption(preview_item.label)
                     st.code(preview_item.prompt, language="text")
                 except Exception as e:
                     st.error(str(e))
@@ -452,13 +462,13 @@ with tab_doc:
                         file_name=f"outpaged_scenes_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip",
                         mime="application/zip",
                         use_container_width=True,
+                        key="doc_download_zip",
                     )
 
-                    # Helpful list so you can copy file names
                     st.subheader("Generated file list")
                     st.dataframe(
                         [{"file": r["file"], "label": r["label"]} for r in rows_for_manifest],
-                        use_container_width=True
+                        use_container_width=True,
                     )
 
 # ===== TAB: SINGLE PROMPT =====
@@ -470,15 +480,12 @@ with tab_single:
         "Prompt",
         value="Laputan observatory walkway: chalk-marked geometric diagrams on flagstones, star charts pinned to rails, a dangling flapper’s bladder on a stick left resting against a post, and brass instruments scattered under cold sky light. Style: vivid chalk pastel illustration with deep 3D depth, rich layered chalk texture, crisp chalk lines, cinematic 16:9, no people, no text.",
         height=150,
+        key="single_prompt_text",
     )
 
     c1, c2 = st.columns([1, 1])
-    preview_btn = c1.button("Preview 1", type="secondary", use_container_width=True)
-    batch_btn = c2.button("Generate batch", type="primary", use_container_width=True)
-
-    ref_bytes = None
-    if ref_img is not None:
-        ref_bytes = ref_img.read()
+    preview_btn = c1.button("Preview 1", type="secondary", use_container_width=True, key="single_preview_btn")
+    batch_btn = c2.button("Generate batch", type="primary", use_container_width=True, key="single_generate_btn")
 
     if preview_btn:
         try:
@@ -493,7 +500,11 @@ with tab_single:
                 reference_image_bytes=ref_bytes,
                 strength=float(strength),
             )
-            st.image(Image.open(io.BytesIO(img_bytes)), caption=f"preview.{output_format}", use_container_width=True)
+            st.image(
+                Image.open(io.BytesIO(img_bytes)),
+                caption=f"preview.{output_format}",
+                use_container_width=True,
+            )
         except Exception as e:
             st.error(str(e))
 
@@ -520,7 +531,11 @@ with tab_single:
                 named_images.append((fname, img_bytes))
 
                 with cols[v % 4]:
-                    st.image(Image.open(io.BytesIO(img_bytes)), caption=fname, use_container_width=True)
+                    st.image(
+                        Image.open(io.BytesIO(img_bytes)),
+                        caption=fname,
+                        use_container_width=True,
+                    )
 
             except Exception as e:
                 st.error(f"Variant {v+1} failed: {e}")
@@ -545,4 +560,5 @@ with tab_single:
                 file_name=f"outpaged_single_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip",
                 mime="application/zip",
                 use_container_width=True,
+                key="single_download_zip",
             )
