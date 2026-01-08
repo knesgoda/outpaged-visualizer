@@ -216,16 +216,10 @@ def _stability_generate_png(
     strength: float = 0.35,
     timeout_s: int = 120,
 ) -> bytes:
-    """
-    Calls Stability "Stable Image" endpoints using multipart form-data.
-
-    Important:
-    - If you send a reference image, the API requires `strength`.
-    """
     url = f"{STABILITY_API_BASE}{endpoint_path}"
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Accept": "image/png",
+        "Accept": "image/*",  # <-- required by the API (or application/json)
     }
 
     data = {
@@ -241,26 +235,21 @@ def _stability_generate_png(
     files = None
     if reference_image_bytes:
         files = {"image": ("reference.png", reference_image_bytes, "image/png")}
-        # REQUIRED when image is provided
-        data["strength"] = str(float(strength))
+        data["strength"] = str(float(strength))  # required when image is provided
 
-    resp = requests.post(
-        url,
-        headers=headers,
-        data=data,
-        files=files,
-        timeout=timeout_s,
-    )
+    resp = requests.post(url, headers=headers, data=data, files=files, timeout=timeout_s)
 
     if resp.status_code == 200:
         return resp.content
 
+    # Helpful error surface
     try:
         err = resp.json()
     except Exception:
         err = {"error": resp.text}
 
     raise RuntimeError(f"Stability API error {resp.status_code}: {json.dumps(err)}")
+
 
 
 def _make_zip(images: List[Tuple[str, bytes]], manifest: dict) -> bytes:
