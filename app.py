@@ -31,7 +31,6 @@ ENDPOINTS = {
 ASPECT_RATIOS = ["16:9", "1:1", "3:2", "2:3", "4:5", "5:4", "9:16"]
 OUTPUT_FORMATS = ["png", "webp", "jpg"]
 
-# Seed range per Stability docs (commonly used range)
 SEED_MOD = 2**32  # 0..4294967295
 
 
@@ -40,9 +39,9 @@ SEED_MOD = 2**32  # 0..4294967295
 # =========================
 @dataclass
 class PromptItem:
-    file_base: str  # ch36bg01
-    label: str      # display label
-    prompt: str     # prompt text
+    file_base: str
+    label: str
+    prompt: str
 
 
 # =========================
@@ -65,8 +64,6 @@ def _get_api_key() -> Optional[str]:
 
 def _read_uploaded_text(uploaded_file) -> str:
     name = (uploaded_file.name or "").lower()
-
-    # IMPORTANT: use getvalue() so it is stable across reruns
     raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
 
     if name.endswith(".txt"):
@@ -95,13 +92,8 @@ def _crc32_int(s: str) -> int:
 
 
 def _scene_seed(base_seed: Optional[int], scene_key: str, variant_index: int) -> Optional[int]:
-    """
-    If base_seed is None -> random seed (return None)
-    If base_seed is set -> make unique deterministic seed per scene + variant
-    """
     if base_seed is None:
         return None
-    # Make each scene different but reproducible
     return int((base_seed + _crc32_int(scene_key) + variant_index) % SEED_MOD)
 
 
@@ -130,7 +122,9 @@ def _parse_background_items(raw_text: str) -> List[PromptItem]:
                 j += 1
             if j < len(lines):
                 nxt = lines[j].strip()
-                if not nxt.lower().startswith("background file name:") and not re.match(r"^scene\s+\d+", nxt, flags=re.IGNORECASE):
+                if not nxt.lower().startswith("background file name:") and not re.match(
+                    r"^scene\s+\d+", nxt, flags=re.IGNORECASE
+                ):
                     current_scene_title = nxt
             i += 1
             continue
@@ -176,7 +170,7 @@ def _parse_background_items(raw_text: str) -> List[PromptItem]:
 
 
 # =========================
-# Stability call
+# Stability call (multipart ALWAYS)
 # =========================
 def _stability_generate(
     api_key: str,
@@ -190,36 +184,41 @@ def _stability_generate(
     strength: float,
     timeout_s: int = 120,
 ) -> bytes:
+    """
+    Stability v2beta stable-image endpoints require multipart/form-data.
+    So we ALWAYS send via `files=` with (None, value) for normal fields.
+    """
     url = f"{STABILITY_API_BASE}{endpoint_path}"
 
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Accept": "image/*",
+        "Accept": "image/*",  # keep this
     }
 
-    data = {
-        "prompt": prompt,
-        "output_format": output_format,
-        "aspect_ratio": aspect_ratio,
-        "mode": "image-to-image" if reference_image_bytes is not None else "text-to-image",
+    # All fields as multipart form fields
+    files = {
+        "prompt": (None, prompt),
+        "output_format": (None, output_format),
+        "aspect_ratio": (None, aspect_ratio),
     }
 
     if negative_prompt.strip():
-        data["negative_prompt"] = negative_prompt.strip()
+        files["negative_prompt"] = (None, negative_prompt.strip())
 
     if seed is not None:
-        data["seed"] = str(int(seed))
+        files["seed"] = (None, str(int(seed)))
 
-    files = None
+    # If reference image, include it + required strength
     if reference_image_bytes is not None:
-        files = {"image": ("reference.png", reference_image_bytes, "image/png")}
-        data["strength"] = str(float(strength))  # required when 'image' is provided
+        files["image"] = ("reference.png", reference_image_bytes, "image/png")
+        files["strength"] = (None, str(float(strength)))
 
-    resp = requests.post(url, headers=headers, data=data, files=files, timeout=timeout_s)
+    resp = requests.post(url, headers=headers, files=files, timeout=timeout_s)
 
     if resp.status_code == 200:
         return resp.content
 
+    # On errors, Stability returns JSON
     try:
         err = resp.json()
     except Exception:
@@ -289,7 +288,6 @@ with st.sidebar:
         key="sb_negative",
     )
 
-# Reference bytes (use getvalue to avoid read pointer issues)
 ref_bytes = None
 if ref_img is not None:
     ref_bytes = ref_img.getvalue() if hasattr(ref_img, "getvalue") else ref_img.read()
@@ -300,7 +298,7 @@ tab_doc, tab_single = st.tabs(["Batch from Doc (Scenes)", "Single Prompt"])
 # ===== TAB: DOC BATCH =====
 with tab_doc:
     st.subheader("Batch from Doc")
-    st.caption("This generates one image per scene file name. Your filenames are preserved.")
+    st.caption("Generates one image per Background file name. Filenames are preserved.")
 
     uploaded = st.file_uploader("Upload your prompt doc (.docx or .txt)", type=["docx", "txt"], key="doc_uploader")
 
@@ -313,10 +311,9 @@ with tab_doc:
         else:
             st.success(f"Found {len(items)} scenes (background prompts).")
 
-            # Quick sanity check: show first few parsed prompts
             with st.expander("Show parsed prompts (sanity check)"):
                 st.dataframe(
-                    [{"file": it.file_base, "label": it.label, "prompt_preview": it.prompt[:140]} for it in items[:25]],
+                    [{"file": it.file_base, "label": it.label, "prompt_preview": it.prompt[:160]} for it in items[:50]],
                     use_container_width=True,
                 )
 
@@ -325,7 +322,7 @@ with tab_doc:
             if "selected_scene_keys" not in st.session_state:
                 st.session_state["selected_scene_keys"] = all_keys
 
-            col1, col2, col3 = st.columns([1, 1, 2])
+            col1, col2, _ = st.columns([1, 1, 2])
             with col1:
                 if st.button("Select all", use_container_width=True, key="doc_select_all"):
                     st.session_state["selected_scene_keys"] = all_keys
@@ -341,12 +338,11 @@ with tab_doc:
             )
             st.session_state["selected_scene_keys"] = selected
 
-            total_outputs = len(selected) * int(variants_per_prompt)
-            st.info(f"Outputs to generate: {len(selected)} scenes × {variants_per_prompt} variants = {total_outputs} images")
-
             selected_items = [it for it in items if it.file_base in selected]
-            preview_options = [it.file_base for it in selected_items] if selected_items else all_keys
+            total_outputs = len(selected_items) * int(variants_per_prompt)
+            st.info(f"Outputs to generate: {len(selected_items)} scenes × {variants_per_prompt} variants = {total_outputs} images")
 
+            preview_options = [it.file_base for it in selected_items] if selected_items else all_keys
             preview_key = st.selectbox("Preview which scene?", options=preview_options, key="doc_preview_scene")
             preview_item = next(it for it in items if it.file_base == preview_key)
 
@@ -399,9 +395,8 @@ with tab_doc:
 
                     for it in selected_items:
                         for v in range(int(variants_per_prompt)):
-                            status.write(f"Generating {done+1} of {total}: {it.file_base}")
+                            status.write(f"Generating {done + 1} of {total}: {it.file_base}")
 
-                            # 🔥 KEY FIX: unique deterministic seed per scene (+ variant)
                             seed = _scene_seed(fixed_seed, it.file_base, v)
 
                             img_bytes = _stability_generate(
@@ -419,7 +414,7 @@ with tab_doc:
                             if int(variants_per_prompt) == 1:
                                 fname = f"{it.file_base}.{output_format}"
                             else:
-                                fname = f"{it.file_base}_v{v+1:02d}.{output_format}"
+                                fname = f"{it.file_base}_v{v + 1:02d}.{output_format}"
 
                             named_images.append((fname, img_bytes))
                             rows_for_manifest.append({
@@ -433,12 +428,8 @@ with tab_doc:
 
                             if thumbs_shown < thumbs_to_show:
                                 with grid[thumbs_shown % 4]:
-                                    st.image(
-                                        Image.open(io.BytesIO(img_bytes)),
-                                        caption=f"{fname}",
-                                        use_container_width=True,
-                                    )
-                                    st.caption(f"{it.label}")
+                                    st.image(Image.open(io.BytesIO(img_bytes)), caption=fname, use_container_width=True)
+                                    st.caption(it.label)
                                 thumbs_shown += 1
 
                             done += 1
@@ -537,7 +528,7 @@ with tab_single:
                     reference_image_bytes=ref_bytes,
                     strength=float(strength),
                 )
-                fname = f"single_v{v+1:02d}.{output_format}"
+                fname = f"single_v{v + 1:02d}.{output_format}"
                 named_images.append((fname, img_bytes))
 
                 with grid[v % 4]:
@@ -548,7 +539,7 @@ with tab_single:
                     )
 
             except Exception as e:
-                st.error(f"Variant {v+1} failed: {e}")
+                st.error(f"Variant {v + 1} failed: {e}")
 
             progress.progress((v + 1) / int(variants_per_prompt))
 
