@@ -3,6 +3,7 @@ import os
 import re
 import json
 import zipfile
+import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -30,6 +31,9 @@ ENDPOINTS = {
 ASPECT_RATIOS = ["16:9", "1:1", "3:2", "2:3", "4:5", "5:4", "9:16"]
 OUTPUT_FORMATS = ["png", "webp", "jpg"]
 
+# Seed range per Stability docs (commonly used range)
+SEED_MOD = 2**32  # 0..4294967295
+
 
 # =========================
 # Data structures
@@ -37,21 +41,19 @@ OUTPUT_FORMATS = ["png", "webp", "jpg"]
 @dataclass
 class PromptItem:
     file_base: str  # ch36bg01
-    label: str      # nice display label (Scene 36 - etc)
+    label: str      # display label
     prompt: str     # prompt text
 
 
 # =========================
-# Key + file helpers
+# API key + file helpers
 # =========================
 def _get_api_key() -> Optional[str]:
-    # Streamlit Secrets: STABILITY_API_KEY="sk-..."
     if hasattr(st, "secrets"):
         k = st.secrets.get("STABILITY_API_KEY", None)
         if k:
             return str(k).strip()
 
-    # Env vars fallback
     k = os.getenv("STABILITY_API_KEY", "").strip()
     if k:
         return k
@@ -63,7 +65,9 @@ def _get_api_key() -> Optional[str]:
 
 def _read_uploaded_text(uploaded_file) -> str:
     name = (uploaded_file.name or "").lower()
-    raw = uploaded_file.read()
+
+    # IMPORTANT: use getvalue() so it is stable across reruns
+    raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
 
     if name.endswith(".txt"):
         return raw.decode("utf-8", errors="ignore")
@@ -84,19 +88,27 @@ def _safe_filename(s: str) -> str:
 
 
 # =========================
-# Parsing your doc format
+# Per-scene seed logic
+# =========================
+def _crc32_int(s: str) -> int:
+    return zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF
+
+
+def _scene_seed(base_seed: Optional[int], scene_key: str, variant_index: int) -> Optional[int]:
+    """
+    If base_seed is None -> random seed (return None)
+    If base_seed is set -> make unique deterministic seed per scene + variant
+    """
+    if base_seed is None:
+        return None
+    # Make each scene different but reproducible
+    return int((base_seed + _crc32_int(scene_key) + variant_index) % SEED_MOD)
+
+
+# =========================
+# Parsing your scene format
 # =========================
 def _parse_background_items(raw_text: str) -> List[PromptItem]:
-    """
-    Extracts blocks like:
-
-    Scene 36
-    Scene 36 - Part III - ...
-    Background file name: ch36bg01
-    <prompt line(s)>
-
-    Stops parsing scenes if "Canonical Master Prompts" appears, since that is character section.
-    """
     lines = [ln.rstrip() for ln in raw_text.splitlines()]
     items: List[PromptItem] = []
 
@@ -110,28 +122,23 @@ def _parse_background_items(raw_text: str) -> List[PromptItem]:
         if ln.lower().startswith("canonical master prompts"):
             break
 
-        # Scene header
         if re.match(r"^scene\s+\d+", ln, flags=re.IGNORECASE):
             current_scene_label = ln
             current_scene_title = ""
-            # try to grab next meaningful line as title
             j = i + 1
             while j < len(lines) and not lines[j].strip():
                 j += 1
             if j < len(lines):
                 nxt = lines[j].strip()
-                # many docs have a descriptive line right after "Scene X"
                 if not nxt.lower().startswith("background file name:") and not re.match(r"^scene\s+\d+", nxt, flags=re.IGNORECASE):
                     current_scene_title = nxt
             i += 1
             continue
 
-        # Background file name line
         if ln.lower().startswith("background file name:"):
             file_base = ln.split(":", 1)[1].strip()
             file_base = _safe_filename(file_base)
 
-            # collect prompt lines until blank line OR next scene OR next background file name OR canonical prompts
             prompt_lines = []
             j = i + 1
             while j < len(lines):
@@ -155,9 +162,7 @@ def _parse_background_items(raw_text: str) -> List[PromptItem]:
                 j += 1
 
             prompt = " ".join(prompt_lines).strip()
-
-            label = current_scene_title or current_scene_label or file_base
-            label = label.strip()
+            label = (current_scene_title or current_scene_label or file_base).strip()
 
             if file_base and prompt:
                 items.append(PromptItem(file_base=file_base, label=label, prompt=prompt))
@@ -196,6 +201,7 @@ def _stability_generate(
         "prompt": prompt,
         "output_format": output_format,
         "aspect_ratio": aspect_ratio,
+        "mode": "image-to-image" if reference_image_bytes is not None else "text-to-image",
     }
 
     if negative_prompt.strip():
@@ -207,7 +213,7 @@ def _stability_generate(
     files = None
     if reference_image_bytes is not None:
         files = {"image": ("reference.png", reference_image_bytes, "image/png")}
-        data["strength"] = str(float(strength))  # required when image provided
+        data["strength"] = str(float(strength))  # required when 'image' is provided
 
     resp = requests.post(url, headers=headers, data=data, files=files, timeout=timeout_s)
 
@@ -236,7 +242,7 @@ def _zip_images(named_images: List[Tuple[str, bytes]], manifest: dict) -> bytes:
 # =========================
 st.set_page_config(page_title="OutPaged Visualizer", layout="wide")
 st.title("📚 OutPaged Visualizer")
-st.caption("Upload your prompt doc, then generate 1 image per scene file name (or more variants if you want).")
+st.caption("Upload your prompt doc, then generate 1 image per Background file name (or more variants).")
 
 api_key = _get_api_key()
 if not api_key:
@@ -246,7 +252,6 @@ if not api_key:
     )
     st.stop()
 
-# Sidebar settings (add keys everywhere to avoid duplicates)
 with st.sidebar:
     st.header("Settings")
 
@@ -258,9 +263,9 @@ with st.sidebar:
 
     variants_per_prompt = st.slider("Variants per prompt", 1, 5, 1, key="sb_variants")
 
-    seed_mode = st.selectbox("Seed mode", ["Fixed (more consistent)", "Random"], index=0, key="sb_seed_mode")
+    seed_mode = st.selectbox("Seed mode", ["Fixed (reproducible)", "Random"], index=0, key="sb_seed_mode")
     fixed_seed = (
-        st.number_input("Seed", min_value=0, max_value=2_147_483_647, value=123456, step=1, key="sb_seed")
+        st.number_input("Base seed", min_value=0, max_value=2_147_483_647, value=123456, step=1, key="sb_seed")
         if seed_mode.startswith("Fixed")
         else None
     )
@@ -279,26 +284,23 @@ with st.sidebar:
     st.subheader("Negative prompt")
     negative_prompt = st.text_area(
         "Negative prompt",
-        value="text, watermark, logo, signature, low quality, blurry, extra limbs, malformed",
+        value="text, watermark, logo, signature, low quality, blurry, malformed",
         height=100,
         key="sb_negative",
     )
 
-# Tabs
-tab_doc, tab_single = st.tabs(["Batch from Doc (Scenes)", "Single Prompt"])
-
-# Read reference bytes once per run (important: file_uploader returns a file-like object)
+# Reference bytes (use getvalue to avoid read pointer issues)
 ref_bytes = None
 if ref_img is not None:
-    try:
-        ref_bytes = ref_img.read()
-    except Exception:
-        ref_bytes = None
+    ref_bytes = ref_img.getvalue() if hasattr(ref_img, "getvalue") else ref_img.read()
+
+tab_doc, tab_single = st.tabs(["Batch from Doc (Scenes)", "Single Prompt"])
+
 
 # ===== TAB: DOC BATCH =====
 with tab_doc:
     st.subheader("Batch from Doc")
-    st.caption("This generates one image per Background file name. If you have 78 scenes and Variants per prompt = 1, you will get 78 images.")
+    st.caption("This generates one image per scene file name. Your filenames are preserved.")
 
     uploaded = st.file_uploader("Upload your prompt doc (.docx or .txt)", type=["docx", "txt"], key="doc_uploader")
 
@@ -310,6 +312,13 @@ with tab_doc:
             st.error("No scenes found. Make sure your doc includes lines like 'Background file name: ch36bg01'.")
         else:
             st.success(f"Found {len(items)} scenes (background prompts).")
+
+            # Quick sanity check: show first few parsed prompts
+            with st.expander("Show parsed prompts (sanity check)"):
+                st.dataframe(
+                    [{"file": it.file_base, "label": it.label, "prompt_preview": it.prompt[:140]} for it in items[:25]],
+                    use_container_width=True,
+                )
 
             all_keys = [it.file_base for it in items]
 
@@ -337,8 +346,8 @@ with tab_doc:
 
             selected_items = [it for it in items if it.file_base in selected]
             preview_options = [it.file_base for it in selected_items] if selected_items else all_keys
-            preview_key = st.selectbox("Preview which scene?", options=preview_options, key="doc_preview_scene")
 
+            preview_key = st.selectbox("Preview which scene?", options=preview_options, key="doc_preview_scene")
             preview_item = next(it for it in items if it.file_base == preview_key)
 
             cA, cB = st.columns([1, 1])
@@ -349,6 +358,7 @@ with tab_doc:
 
             if preview_btn:
                 try:
+                    seed_for_preview = _scene_seed(fixed_seed, preview_item.file_base, 0)
                     img_bytes = _stability_generate(
                         api_key=api_key,
                         endpoint_path=endpoint_path,
@@ -356,13 +366,13 @@ with tab_doc:
                         negative_prompt=negative_prompt,
                         aspect_ratio=aspect_ratio,
                         output_format=output_format,
-                        seed=int(fixed_seed) if fixed_seed is not None else None,
+                        seed=seed_for_preview,
                         reference_image_bytes=ref_bytes,
                         strength=float(strength),
                     )
                     st.image(
                         Image.open(io.BytesIO(img_bytes)),
-                        caption=f"{preview_item.file_base}.{output_format}",
+                        caption=f"{preview_item.file_base}.{output_format} (seed={seed_for_preview})",
                         use_container_width=True,
                     )
                     st.caption(preview_item.label)
@@ -383,16 +393,16 @@ with tab_doc:
                     total = len(selected_items) * int(variants_per_prompt)
                     done = 0
 
-                    # Show only first N thumbnails so the page does not explode
                     thumbs_to_show = 12
                     thumbs_shown = 0
-                    cols = st.columns(4)
+                    grid = st.columns(4)
 
                     for it in selected_items:
                         for v in range(int(variants_per_prompt)):
                             status.write(f"Generating {done+1} of {total}: {it.file_base}")
 
-                            seed = (int(fixed_seed) + v) if fixed_seed is not None else None
+                            # 🔥 KEY FIX: unique deterministic seed per scene (+ variant)
+                            seed = _scene_seed(fixed_seed, it.file_base, v)
 
                             img_bytes = _stability_generate(
                                 api_key=api_key,
@@ -406,9 +416,6 @@ with tab_doc:
                                 strength=float(strength),
                             )
 
-                            # File naming rule:
-                            # - If 1 variant: ch36bg01.png
-                            # - If multiple: ch36bg01_v02.png
                             if int(variants_per_prompt) == 1:
                                 fname = f"{it.file_base}.{output_format}"
                             else:
@@ -421,16 +428,17 @@ with tab_doc:
                                 "label": it.label,
                                 "prompt": it.prompt,
                                 "variant": v + 1,
+                                "seed": seed,
                             })
 
                             if thumbs_shown < thumbs_to_show:
-                                with cols[thumbs_shown % 4]:
+                                with grid[thumbs_shown % 4]:
                                     st.image(
                                         Image.open(io.BytesIO(img_bytes)),
-                                        caption=fname,
+                                        caption=f"{fname}",
                                         use_container_width=True,
                                     )
-                                    st.caption(it.label)
+                                    st.caption(f"{it.label}")
                                 thumbs_shown += 1
 
                             done += 1
@@ -447,7 +455,7 @@ with tab_doc:
                         "output_format": output_format,
                         "variants_per_prompt": int(variants_per_prompt),
                         "seed_mode": seed_mode,
-                        "seed": int(fixed_seed) if fixed_seed is not None else None,
+                        "base_seed": int(fixed_seed) if fixed_seed is not None else None,
                         "has_reference_image": bool(ref_img),
                         "strength": float(strength) if ref_img else None,
                         "negative_prompt": negative_prompt,
@@ -467,14 +475,15 @@ with tab_doc:
 
                     st.subheader("Generated file list")
                     st.dataframe(
-                        [{"file": r["file"], "label": r["label"]} for r in rows_for_manifest],
+                        [{"file": r["file"], "label": r["label"], "seed": r["seed"]} for r in rows_for_manifest],
                         use_container_width=True,
                     )
+
 
 # ===== TAB: SINGLE PROMPT =====
 with tab_single:
     st.subheader("Single Prompt")
-    st.caption("This tab generates variants of one prompt only.")
+    st.caption("Generate variants of one prompt.")
 
     prompt_text = st.text_area(
         "Prompt",
@@ -489,6 +498,7 @@ with tab_single:
 
     if preview_btn:
         try:
+            seed_for_preview = _scene_seed(fixed_seed, prompt_text, 0)
             img_bytes = _stability_generate(
                 api_key=api_key,
                 endpoint_path=endpoint_path,
@@ -496,13 +506,13 @@ with tab_single:
                 negative_prompt=negative_prompt,
                 aspect_ratio=aspect_ratio,
                 output_format=output_format,
-                seed=int(fixed_seed) if fixed_seed is not None else None,
+                seed=seed_for_preview,
                 reference_image_bytes=ref_bytes,
                 strength=float(strength),
             )
             st.image(
                 Image.open(io.BytesIO(img_bytes)),
-                caption=f"preview.{output_format}",
+                caption=f"preview.{output_format} (seed={seed_for_preview})",
                 use_container_width=True,
             )
         except Exception as e:
@@ -510,11 +520,11 @@ with tab_single:
 
     if batch_btn:
         named_images: List[Tuple[str, bytes]] = []
-        cols = st.columns(4)
+        grid = st.columns(4)
         progress = st.progress(0)
 
         for v in range(int(variants_per_prompt)):
-            seed = (int(fixed_seed) + v) if fixed_seed is not None else None
+            seed = _scene_seed(fixed_seed, prompt_text, v)
             try:
                 img_bytes = _stability_generate(
                     api_key=api_key,
@@ -530,10 +540,10 @@ with tab_single:
                 fname = f"single_v{v+1:02d}.{output_format}"
                 named_images.append((fname, img_bytes))
 
-                with cols[v % 4]:
+                with grid[v % 4]:
                     st.image(
                         Image.open(io.BytesIO(img_bytes)),
-                        caption=fname,
+                        caption=f"{fname} (seed={seed})",
                         use_container_width=True,
                     )
 
@@ -552,6 +562,8 @@ with tab_single:
                 "variants_per_prompt": int(variants_per_prompt),
                 "prompt": prompt_text,
                 "negative_prompt": negative_prompt,
+                "seed_mode": seed_mode,
+                "base_seed": int(fixed_seed) if fixed_seed is not None else None,
             }
             zip_bytes = _zip_images(named_images, manifest)
             st.download_button(
