@@ -1,309 +1,219 @@
-import os
 import io
+import os
 import re
 import zipfile
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple
 
+import requests
 import streamlit as st
 from PIL import Image
 
-from stability_sdk import client
-import stability_sdk.interfaces.gooseai.generation.generation_pb2 as generation
+try:
+    from docx import Document
+except Exception:
+    Document = None
 
-from docx import Document
+
+# =========================
+# Configuration
+# =========================
+
+STABILITY_API_BASE = "https://api.stability.ai"
+ULTRA_ENDPOINT = f"{STABILITY_API_BASE}/v2beta/stable-image/generate/ultra"
+CORE_ENDPOINT = f"{STABILITY_API_BASE}/v2beta/stable-image/generate/core"
+
+DEFAULT_NEGATIVE = (
+    "low quality, blurry, jpeg artifacts, watermark, signature, text, logo, "
+    "extra limbs, deformed, bad anatomy, oversaturated"
+)
+
+ASPECT_RATIOS = ["16:9", "1:1", "3:2", "2:3", "4:5", "5:4", "9:16"]
+OUTPUT_FORMATS = ["png", "webp", "jpg"]
+
+
+@dataclass
+class PromptItem:
+    file_base: str
+    prompt: str
 
 
 # =========================
 # Helpers
 # =========================
 
-def _get_stability_key() -> str:
-    # Prefer Streamlit Secrets, fallback to env var
-    key = ""
-    try:
-        key = st.secrets.get("STABILITY_KEY", "")
-    except Exception:
-        key = ""
+def _get_api_key() -> Optional[str]:
+    # Streamlit Cloud best practice: put this in App Settings -> Secrets
+    # STABILITY_KEY="sk-..."
+    key = None
+    if hasattr(st, "secrets"):
+        key = st.secrets.get("STABILITY_KEY", None)
     if not key:
-        key = os.getenv("STABILITY_KEY", "")
-    return (key or "").strip()
+        key = os.getenv("STABILITY_KEY")
+    return key
 
 
-def _init_stability(engine: str, key: str) -> client.StabilityInference:
-    # Host can be set in secrets or env, default to official
-    host = ""
-    try:
-        host = st.secrets.get("STABILITY_HOST", "")
-    except Exception:
-        host = ""
-    if not host:
-        host = os.getenv("STABILITY_HOST", "grpc.stability.ai")
-
-    os.environ["STABILITY_HOST"] = host
-    os.environ["STABILITY_KEY"] = key
-
-    return client.StabilityInference(
-        key=key,
-        verbose=False,
-        engine=engine,
-    )
-
-
-def _build_weighted_prompts(positive_text: str, negative_text: str) -> List[generation.Prompt]:
-    """
-    stability-sdk expects prompt weights via PromptParameters(weight=...),
-    not generation.Prompt(..., weight=...).
-    """
-    positive_text = (positive_text or "").strip()
-    negative_text = (negative_text or "").strip()
-
-    prompts: List[generation.Prompt] = []
-    if positive_text:
-        prompts.append(
-            generation.Prompt(
-                text=positive_text,
-                parameters=generation.PromptParameters(weight=1.0),
-            )
-        )
-
-    if negative_text:
-        prompts.append(
-            generation.Prompt(
-                text=negative_text,
-                parameters=generation.PromptParameters(weight=-1.0),
-            )
-        )
-
-    return prompts
-
-
-def _docx_to_text(file_bytes: bytes) -> str:
-    bio = io.BytesIO(file_bytes)
-    doc = Document(bio)
-    parts = []
-    for p in doc.paragraphs:
-        t = (p.text or "").rstrip()
-        if t:
-            parts.append(t)
-    return "\n".join(parts).strip()
-
-
-def _bytes_to_text(uploaded_file) -> str:
-    if uploaded_file is None:
-        return ""
-    raw = uploaded_file.read()
+def _read_uploaded_text(uploaded_file) -> str:
     name = (uploaded_file.name or "").lower()
+
+    if name.endswith(".txt"):
+        return uploaded_file.read().decode("utf-8", errors="ignore")
+
     if name.endswith(".docx"):
-        return _docx_to_text(raw)
-    # assume text
-    try:
-        return raw.decode("utf-8")
-    except Exception:
-        return raw.decode("latin-1", errors="ignore")
+        if Document is None:
+            raise RuntimeError("python-docx not available. Check requirements.txt.")
+        doc = Document(uploaded_file)
+        return "\n".join([p.text for p in doc.paragraphs])
+
+    raise ValueError("Unsupported file type. Upload .txt or .docx")
 
 
-@dataclass
-class ScenePrompt:
-    scene_title: str
-    file_name: str
-    prompt: str
-
-
-def _parse_scenes(raw_text: str) -> List[ScenePrompt]:
+def _parse_background_items(raw_text: str) -> List[PromptItem]:
     """
-    Parses blocks like:
-    Scene 01 ...
-    Background file name: ch01bg01
-    <prompt...>
+    Looks for blocks like:
+      Background file name: ch01bg01
+      <prompt line(s)>
 
-    It is tolerant to extra lines.
+    It will grab the file base and the next non-empty line(s) until a blank line
+    or the next "Scene" block header.
     """
-    txt = (raw_text or "").strip()
-    if not txt:
-        return []
+    lines = [ln.rstrip() for ln in raw_text.splitlines()]
+    items: List[PromptItem] = []
 
-    # Split on "Scene" headings
-    chunks = re.split(r"\n(?=Scene\s+\d+)", txt, flags=re.IGNORECASE)
-    scenes: List[ScenePrompt] = []
-
-    for chunk in chunks:
-        c = chunk.strip()
-        if not c.lower().startswith("scene"):
-            continue
-
-        # File name
-        m_fn = re.search(r"Background file name:\s*([A-Za-z0-9_\-]+)", c, flags=re.IGNORECASE)
-        if not m_fn:
-            continue
-        file_name = m_fn.group(1).strip()
-
-        # Title: first non-empty line after "Scene X"
-        lines = [ln.strip() for ln in c.splitlines() if ln.strip()]
-        scene_title = lines[0] if lines else file_name
-
-        # Prompt: take text after the background file name line
-        # Find the line index containing "Background file name:"
-        prompt_text = ""
-        for i, ln in enumerate(lines):
-            if re.search(r"^Background file name:", ln, flags=re.IGNORECASE):
-                prompt_text = "\n".join(lines[i + 1 :]).strip()
-                break
-
-        # Stop prompt if it runs into "Canonical Master Prompts"
-        prompt_text = re.split(r"\nCanonical Master Prompts", prompt_text, flags=re.IGNORECASE)[0].strip()
-
-        if prompt_text:
-            scenes.append(ScenePrompt(scene_title=scene_title, file_name=file_name, prompt=prompt_text))
-
-    return scenes
-
-
-def _parse_canonical_characters(raw_text: str) -> Dict[str, str]:
-    """
-    Parses Canonical Master Prompts section into a dict: name -> prompt.
-    Assumes format:
-    Canonical Master Prompts
-    <optional lines>
-    Character Name
-    Character prompt paragraph...
-    Next Character Name
-    ...
-    """
-    txt = (raw_text or "")
-    m = re.search(r"Canonical Master Prompts(.+)$", txt, flags=re.IGNORECASE | re.DOTALL)
-    if not m:
-        return {}
-
-    body = m.group(1).strip()
-    if not body:
-        return {}
-
-    lines = [ln.rstrip() for ln in body.splitlines()]
-    # Remove "Use these master prompts..." helper line(s)
-    cleaned = []
-    for ln in lines:
-        if not ln.strip():
-            cleaned.append("")
-            continue
-        if re.search(r"Use these master prompts", ln, flags=re.IGNORECASE):
-            continue
-        cleaned.append(ln)
-
-    # Heuristic: a character name is a non-empty line with no comma and short-ish
-    # then prompt is following paragraph(s) until next name line.
-    chars: Dict[str, str] = {}
     i = 0
-    while i < len(cleaned):
-        name = cleaned[i].strip()
-        if not name:
+    while i < len(lines):
+        ln = lines[i].strip()
+        if ln.lower().startswith("background file name:"):
+            file_base = ln.split(":", 1)[1].strip()
             i += 1
+
+            # collect prompt lines until blank line OR next scene header-ish
+            prompt_lines = []
+            while i < len(lines):
+                cur = lines[i].strip()
+                if cur == "":
+                    if prompt_lines:
+                        break
+                    i += 1
+                    continue
+
+                # stop if we hit a new scene label
+                if re.match(r"^scene\s+\d+", cur.lower()):
+                    break
+                if cur.lower().startswith("background file name:"):
+                    break
+
+                prompt_lines.append(cur)
+                i += 1
+
+            prompt = " ".join(prompt_lines).strip()
+            if file_base and prompt:
+                items.append(PromptItem(file_base=file_base, prompt=prompt))
             continue
 
-        # probable name line
-        is_name = (len(name) <= 60) and ("," not in name) and (not name.lower().startswith("use these"))
-        if not is_name:
-            i += 1
-            continue
+        i += 1
 
-        # collect prompt lines after name until next probable name
-        j = i + 1
-        prompt_lines = []
-        while j < len(cleaned):
-            nxt = cleaned[j].strip()
-            if nxt and (len(nxt) <= 60) and ("," not in nxt) and (not nxt.lower().startswith("use these")):
-                # looks like next name
-                break
-            prompt_lines.append(cleaned[j])
-            j += 1
-
-        prompt = "\n".join([p for p in prompt_lines if p.strip()]).strip()
-        if prompt:
-            chars[name] = prompt
-
-        i = j
-
-    return chars
+    return items
 
 
-def _safe_filename(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^a-z0-9_\-]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s or "asset"
-
-
-def _generate_images(
-    stability_api: client.StabilityInference,
-    positive_text: str,
-    negative_text: str,
-    width: int,
-    height: int,
-    samples: int,
-    steps: int,
-    cfg_scale: float,
-    seed: Optional[int],
-    init_image: Optional[Image.Image],
-    start_schedule: Optional[float],
-    use_style_preset: bool,
-    style_preset: str,
-) -> List[Image.Image]:
+def _make_character_training_prompts(name: str, base_prompt: str) -> List[PromptItem]:
     """
-    Returns list of PIL Images.
+    For training:
+      1) neutral full body
+      2) face straight
+      3) face 45
+      4) face profile
     """
-    if not positive_text.strip():
-        return []
+    clean = re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip()).strip("_").lower()
+    if not clean:
+        clean = "character"
 
-    prompt_payload = positive_text
-    prompts = _build_weighted_prompts(positive_text, negative_text)
-    if len(prompts) >= 2:
-        # For multi-prompting (including negative prompt), pass prompt as list of generation.Prompt
-        prompt_payload = prompts
-
-    kwargs = dict(
-        prompt=prompt_payload,
-        samples=int(samples),
-        steps=int(steps),
-        cfg_scale=float(cfg_scale),
-        width=int(width),
-        height=int(height),
+    # You can tweak these strings any time to match your pipeline
+    body_suffix = (
+        "Neutral standing pose, arms relaxed at sides, full body visible, centered, "
+        "no background, no shadow, no text."
     )
+    face_common = (
+        "Head and shoulders portrait, tight framing, neutral expression, "
+        "no background, no shadow, no text."
+    )
+
+    items = [
+        PromptItem(file_base=f"{clean}_body_neutral", prompt=f"{base_prompt} {body_suffix}"),
+        PromptItem(file_base=f"{clean}_face_front", prompt=f"{base_prompt} {face_common} Facing camera straight on."),
+        PromptItem(file_base=f"{clean}_face_45", prompt=f"{base_prompt} {face_common} 45 degree angle view."),
+        PromptItem(file_base=f"{clean}_face_profile", prompt=f"{base_prompt} {face_common} Side profile view."),
+    ]
+    return items
+
+
+def _stability_generate_one(
+    api_key: str,
+    endpoint: str,
+    prompt: str,
+    negative_prompt: str,
+    aspect_ratio: str,
+    output_format: str,
+    seed: Optional[int] = None,
+    reference_image_bytes: Optional[bytes] = None,
+    image_denoise: float = 0.45,
+    timeout_s: int = 120,
+) -> bytes:
+    """
+    Uses Stability Stable Image REST endpoints (Ultra/Core).
+    Official docs show Bearer auth and Accept: image/* patterns. :contentReference[oaicite:4]{index=4}
+    Some clients also pass image_denoise for reference-image steering. :contentReference[oaicite:5]{index=5}
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "image/*",
+    }
+
+    data = {
+        "prompt": prompt,
+        "output_format": output_format,
+        "aspect_ratio": aspect_ratio,
+    }
+
+    if negative_prompt.strip():
+        data["negative_prompt"] = negative_prompt.strip()
 
     if seed is not None:
-        kwargs["seed"] = int(seed)
+        data["seed"] = str(int(seed))
 
-    if init_image is not None:
-        kwargs["init_image"] = init_image
-        # start_schedule controls how much the init_image influences the result
-        # lower values keep more of the init_image; 1.0 means text-only
-        if start_schedule is not None:
-            kwargs["start_schedule"] = float(start_schedule)
+    files = None
+    if reference_image_bytes is not None:
+        # multipart with an image field named "image"
+        files = {
+            "image": ("reference.png", reference_image_bytes, "image/png")
+        }
+        # Many clients use image_denoise to control how strongly to follow the reference image. :contentReference[oaicite:6]{index=6}
+        data["image_denoise"] = str(float(image_denoise))
 
-    # Only pass style_preset if you explicitly want it.
-    if use_style_preset and style_preset:
-        kwargs["style_preset"] = style_preset
+    resp = requests.post(
+        endpoint,
+        headers=headers,
+        data=data,
+        files=files,
+        timeout=timeout_s,
+    )
 
-    answers = stability_api.generate(**kwargs)
+    if not resp.ok:
+        # Streamlit will redact some errors automatically; show useful status and body
+        raise RuntimeError(f"Stability API error {resp.status_code}: {resp.text}")
 
-    out: List[Image.Image] = []
-    for resp in answers:
-        for artifact in resp.artifacts:
-            if artifact.finish_reason == generation.FILTER:
-                # safety filter hit
-                continue
-            if artifact.type == generation.ARTIFACT_IMAGE:
-                img = Image.open(io.BytesIO(artifact.binary)).convert("RGB")
-                out.append(img)
-    return out
+    return resp.content
 
 
-def _zip_images(named_images: List[Tuple[str, Image.Image]]) -> bytes:
+def _bytes_to_pil(img_bytes: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+
+
+def _zip_images(named_images: List[Tuple[str, bytes]]) -> bytes:
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name, img in named_images:
-            img_bytes = io.BytesIO()
-            img.save(img_bytes, format="PNG")
-            zf.writestr(name, img_bytes.getvalue())
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, b in named_images:
+            zf.writestr(name, b)
     return buf.getvalue()
 
 
@@ -313,295 +223,333 @@ def _zip_images(named_images: List[Tuple[str, Image.Image]]) -> bytes:
 
 st.set_page_config(page_title="OutPaged Visualizer", layout="wide")
 st.title("📚 OutPaged Visualizer")
-st.caption("Generate backgrounds, characters, and training packs from your prompts. Built for StoryTech AI workflows.")
+st.caption("Generate consistent background and character training images using Stability Stable Image (Ultra/Core).")
 
-stability_key = _get_stability_key()
+api_key = _get_api_key()
+if not api_key:
+    st.warning(
+        "Add your API key as STABILITY_KEY in Streamlit Cloud Secrets, or as an environment variable. "
+        "Example in Secrets:\n\nSTABILITY_KEY = \"sk-...\""
+    )
+    st.stop()
 
 with st.sidebar:
-    st.header("Connection")
-    if stability_key:
-        st.success("STABILITY_KEY found")
-    else:
-        st.error("Missing STABILITY_KEY (Streamlit Secrets or env var)")
+    st.header("Generator Settings")
 
-    st.header("Generation Settings")
-    engine = st.selectbox(
-        "Engine",
-        [
-            "stable-diffusion-xl-1024-v1-0",
-            "stable-diffusion-v1-6",
-        ],
+    model_choice = st.selectbox(
+        "Model",
+        ["Stable Image Ultra (best quality)", "Stable Image Core (faster)"],
         index=0,
     )
+    endpoint = ULTRA_ENDPOINT if model_choice.startswith("Stable Image Ultra") else CORE_ENDPOINT
 
-    steps = st.slider("Steps", 10, 60, 30)
-    cfg_scale = st.slider("CFG Scale", 1.0, 15.0, 7.0, 0.5)
-    seed_input = st.text_input("Seed (optional)", value="")
-    seed = None
-    if seed_input.strip():
-        try:
-            seed = int(seed_input.strip())
-        except Exception:
-            st.warning("Seed must be an integer or blank.")
-            seed = None
+    aspect_ratio = st.selectbox("Aspect Ratio", ASPECT_RATIOS, index=0)
+    output_format = st.selectbox("Output Format", OUTPUT_FORMATS, index=0)
 
-    st.header("Style Preset (optional)")
-    use_style_preset = st.checkbox(
-        "Use style_preset (can override prompt style)",
-        value=False,
-        help="If off, your prompt text fully controls style.",
-    )
-    style_preset = st.selectbox(
-        "Preset",
-        ["cinematic", "fantasy-art", "photographic", "comic-book", "pixel-art"],
-        index=0,
-        disabled=(not use_style_preset),
+    st.divider()
+    use_seed = st.checkbox("Lock Seed (more consistent)", value=True)
+    seed = st.number_input("Seed", min_value=0, max_value=2_147_483_647, value=123456, step=1) if use_seed else None
+
+    variants = st.slider("Variants per prompt", 1, 8, 2)
+
+    st.divider()
+    st.subheader("Reference Image (optional)")
+    ref_img = st.file_uploader("Upload reference image (PNG/JPG)", type=["png", "jpg", "jpeg"], accept_multiple_files=False)
+    image_denoise = st.slider(
+        "Reference strength (image_denoise)",
+        0.0, 1.0, 0.45,
+        help="Lower keeps closer to the reference image. Higher reimagines more."
     )
 
-    st.header("Reference Image (optional)")
-    ref_file = st.file_uploader("Upload reference image (PNG/JPG)", type=["png", "jpg", "jpeg"])
-    init_image = None
-    if ref_file is not None:
-        init_image = Image.open(ref_file).convert("RGB")
-        st.image(init_image, caption="Reference image", use_container_width=True)
+    st.divider()
+    st.subheader("Negative prompt")
+    negative_prompt = st.text_area("Negative prompt", value=DEFAULT_NEGATIVE, height=120)
 
-    start_schedule = None
-    if init_image is not None:
-        start_schedule = st.slider(
-            "Init influence (start_schedule)",
-            0.1, 1.0, 0.6, 0.05,
-            help="Lower = more like the reference image. 1.0 = text-only.",
-        )
+tab1, tab2, tab3 = st.tabs(["Single Prompt", "Upload Doc (Backgrounds)", "Character Training Pack"])
 
 
-st.divider()
-
-tab_bg, tab_char = st.tabs(["🌄 Backgrounds (Scenes)", "🧍 Characters (Training Pack)"])
-
-# ---------- Backgrounds ----------
-with tab_bg:
-    st.subheader("Background generation from Scene prompts")
-
+# -------------------------
+# Tab 1: Single prompt
+# -------------------------
+with tab1:
+    st.subheader("Single Prompt")
+    prompt_text = st.text_area(
+        "Prompt",
+        value="Rocky coastline after a violent storm, shattered mast and sailcloth tangled in seaweed, wet sand with oversized human footprints leading inland, tiny arrows and thread-thin ropes scattered near the prints, cold dawn fog rolling off the sea. Style: vivid chalk pastel illustration with deep 3D depth, rich layered chalk texture, crisp chalk lines, cinematic 16:9, no people, no text.",
+        height=160,
+    )
     colA, colB = st.columns([1, 1])
-
     with colA:
-        uploaded_doc = st.file_uploader("Upload a DOCX or TXT with Scene prompts", type=["docx", "txt"], key="bg_doc")
-        raw_text = _bytes_to_text(uploaded_doc) if uploaded_doc else ""
-        pasted = st.text_area(
-            "Or paste prompts here",
-            value=raw_text,
-            height=280,
-            placeholder="Paste your Scene blocks here...",
-        )
-
-        negative_text = st.text_input(
-            "Negative prompt (optional)",
-            value="text, watermark, logo, signature, blurry, low quality",
-            help="This SDK does not accept negative_prompt=..., so we apply it via weighted prompts.",
-        )
-
+        preview_btn = st.button("Preview 1", type="primary")
     with colB:
-        st.markdown("**Output size**")
-        ratio = st.selectbox("Aspect ratio", ["16:9 (cinematic)", "1:1 (square)"], index=0)
-        if ratio.startswith("16:9"):
-            width, height = 1024, 576
-        else:
-            width, height = 1024, 1024
+        run_btn = st.button("Generate Batch")
 
-        samples = st.slider("Images per scene", 1, 12, 2)
-        preview_only = st.checkbox("Preview mode (only 1 scene)", value=True)
-
-        st.info("Tip: Put your full style in the prompt (ex: chalk pastel, textured paper, crisp chalk lines). Leave style_preset off.")
-
-    scenes = _parse_scenes(pasted)
-    if not scenes:
-        st.warning("No scenes parsed yet. Make sure your text contains 'Background file name: ...' lines.")
+    if ref_img is not None:
+        ref_bytes = ref_img.read()
+        st.image(ref_bytes, caption="Reference image", use_container_width=True)
     else:
-        st.write(f"Parsed scenes: **{len(scenes)}**")
+        ref_bytes = None
 
-        # Scene picker
-        scene_labels = [f"{s.file_name} | {s.scene_title}" for s in scenes]
-        picked = st.multiselect(
-            "Select scenes to generate",
-            options=scene_labels,
-            default=[scene_labels[0]] if scene_labels else [],
-        )
+    if preview_btn:
+        try:
+            img_bytes = _stability_generate_one(
+                api_key=api_key,
+                endpoint=endpoint,
+                prompt=prompt_text,
+                negative_prompt=negative_prompt,
+                aspect_ratio=aspect_ratio,
+                output_format=output_format,
+                seed=int(seed) if seed is not None else None,
+                reference_image_bytes=ref_bytes,
+                image_denoise=float(image_denoise),
+            )
+            img = _bytes_to_pil(img_bytes)
+            st.image(img, caption="Preview", use_container_width=True)
+        except Exception as e:
+            st.error(str(e))
 
-        selected_scenes = [scenes[i] for i, lab in enumerate(scene_labels) if lab in picked]
+    if run_btn:
+        named: List[Tuple[str, bytes]] = []
+        progress = st.progress(0)
+        gallery = st.container()
 
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            go_preview = st.button("Generate preview", type="primary", disabled=(not stability_key or not selected_scenes))
-        with col2:
-            go_batch = st.button("Generate batch", disabled=(not stability_key or not selected_scenes))
+        for i in range(variants):
+            try:
+                img_bytes = _stability_generate_one(
+                    api_key=api_key,
+                    endpoint=endpoint,
+                    prompt=prompt_text,
+                    negative_prompt=negative_prompt,
+                    aspect_ratio=aspect_ratio,
+                    output_format=output_format,
+                    seed=(int(seed) + i) if seed is not None else None,
+                    reference_image_bytes=ref_bytes,
+                    image_denoise=float(image_denoise),
+                )
+                fname = f"single_v{i+1:02d}.{output_format}"
+                named.append((fname, img_bytes))
+            except Exception as e:
+                st.error(f"Variant {i+1} failed: {e}")
 
-        if (go_preview or go_batch) and stability_key:
-            stability_api = _init_stability(engine=engine, key=stability_key)
+            progress.progress((i + 1) / variants)
 
-            run_scenes = selected_scenes[:1] if (preview_only or go_preview) else selected_scenes
+        if named:
+            cols = st.columns(4)
+            for idx, (fname, b) in enumerate(named):
+                with cols[idx % 4]:
+                    st.image(_bytes_to_pil(b), caption=fname, use_container_width=True)
 
-            named_images: List[Tuple[str, Image.Image]] = []
-            prog = st.progress(0)
-            total = len(run_scenes)
+            zip_bytes = _zip_images(named)
+            st.download_button(
+                "Download ZIP",
+                data=zip_bytes,
+                file_name="outpaged_images.zip",
+                mime="application/zip",
+            )
 
-            for idx, scene in enumerate(run_scenes, start=1):
-                st.markdown(f"### {scene.file_name}")
-                st.code(scene.prompt, language="text")
 
-                imgs = _generate_images(
-                    stability_api=stability_api,
-                    positive_text=scene.prompt,
-                    negative_text=negative_text,
-                    width=width,
-                    height=height,
-                    samples=samples if go_batch else 1,
-                    steps=steps,
-                    cfg_scale=cfg_scale,
-                    seed=seed,
-                    init_image=init_image,
-                    start_schedule=start_schedule,
-                    use_style_preset=use_style_preset,
-                    style_preset=style_preset,
+# -------------------------
+# Tab 2: Upload doc + parse backgrounds
+# -------------------------
+with tab2:
+    st.subheader("Upload Doc and Batch Generate Backgrounds")
+    st.caption("Upload a .docx or .txt that contains lines like 'Background file name: ch01bg01' followed by the prompt.")
+
+    uploaded = st.file_uploader("Upload .docx or .txt", type=["docx", "txt"], accept_multiple_files=False)
+    if uploaded:
+        try:
+            raw = _read_uploaded_text(uploaded)
+            items = _parse_background_items(raw)
+
+            if not items:
+                st.warning("No background prompts found. Make sure the doc includes 'Background file name:' lines.")
+            else:
+                st.success(f"Found {len(items)} background prompts.")
+                file_names = [it.file_base for it in items]
+
+                selected = st.multiselect(
+                    "Select scenes to generate",
+                    options=file_names,
+                    default=file_names[: min(10, len(file_names))],
                 )
 
-                if not imgs:
-                    st.error("No images returned (possible safety filter or API error). Check Streamlit logs.")
-                else:
-                    cols = st.columns(min(4, len(imgs)))
-                    for i, img in enumerate(imgs):
-                        fname = f"{scene.file_name}_v{str(i+1).zfill(2)}.png"
-                        named_images.append((fname, img))
-                        with cols[i % len(cols)]:
-                            st.image(img, caption=fname, use_container_width=True)
+                preview_name = st.selectbox("Preview which one?", options=selected if selected else file_names)
+                preview_item = next((it for it in items if it.file_base == preview_name), items[0])
 
-                prog.progress(int((idx / total) * 100))
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("Preview Selected", type="primary"):
+                        ref_bytes = ref_img.read() if ref_img is not None else None
+                        try:
+                            img_bytes = _stability_generate_one(
+                                api_key=api_key,
+                                endpoint=endpoint,
+                                prompt=preview_item.prompt,
+                                negative_prompt=negative_prompt,
+                                aspect_ratio=aspect_ratio,
+                                output_format=output_format,
+                                seed=int(seed) if seed is not None else None,
+                                reference_image_bytes=ref_bytes,
+                                image_denoise=float(image_denoise),
+                            )
+                            st.image(_bytes_to_pil(img_bytes), caption=preview_item.file_base, use_container_width=True)
+                        except Exception as e:
+                            st.error(str(e))
 
-            if named_images:
-                zip_bytes = _zip_images(named_images)
-                st.download_button(
-                    "Download ZIP",
-                    data=zip_bytes,
-                    file_name="outpaged_backgrounds.zip",
-                    mime="application/zip",
-                )
+                with col2:
+                    run_selected = st.button("Generate All Selected")
+
+                if run_selected and selected:
+                    ref_bytes = ref_img.read() if ref_img is not None else None
+
+                    chosen_items = [it for it in items if it.file_base in selected]
+                    named: List[Tuple[str, bytes]] = []
+
+                    total = len(chosen_items) * variants
+                    done = 0
+                    progress = st.progress(0)
+
+                    gallery_cols = st.columns(4)
+                    thumb_count = 0
+
+                    for it in chosen_items:
+                        for v in range(variants):
+                            try:
+                                img_bytes = _stability_generate_one(
+                                    api_key=api_key,
+                                    endpoint=endpoint,
+                                    prompt=it.prompt,
+                                    negative_prompt=negative_prompt,
+                                    aspect_ratio=aspect_ratio,
+                                    output_format=output_format,
+                                    seed=(int(seed) + v) if seed is not None else None,
+                                    reference_image_bytes=ref_bytes,
+                                    image_denoise=float(image_denoise),
+                                )
+                                fname = f"{it.file_base}_v{v+1:02d}.{output_format}"
+                                named.append((fname, img_bytes))
+
+                                # Show a few thumbnails so you see it working
+                                if thumb_count < 12:
+                                    with gallery_cols[thumb_count % 4]:
+                                        st.image(_bytes_to_pil(img_bytes), caption=fname, use_container_width=True)
+                                    thumb_count += 1
+
+                            except Exception as e:
+                                st.error(f"{it.file_base} v{v+1} failed: {e}")
+
+                            done += 1
+                            progress.progress(done / max(1, total))
+
+                    if named:
+                        zip_bytes = _zip_images(named)
+                        st.download_button(
+                            "Download ZIP",
+                            data=zip_bytes,
+                            file_name="outpaged_backgrounds.zip",
+                            mime="application/zip",
+                        )
+
+        except Exception as e:
+            st.error(str(e))
 
 
-# ---------- Characters ----------
-with tab_char:
-    st.subheader("Character training pack: full body + 3 face angles")
+# -------------------------
+# Tab 3: Character training pack
+# -------------------------
+with tab3:
+    st.subheader("Character Training Pack")
+    st.caption("Paste one character prompt, pick a name, then generate neutral body + 3 face angles.")
 
-    uploaded_doc_c = st.file_uploader("Upload a DOCX or TXT with Canonical Master Prompts", type=["docx", "txt"], key="char_doc")
-    raw_text_c = _bytes_to_text(uploaded_doc_c) if uploaded_doc_c else ""
-
-    pasted_c = st.text_area(
-        "Or paste Canonical Master Prompts here",
-        value=raw_text_c,
-        height=220,
-        placeholder="Paste the Canonical Master Prompts section here...",
+    char_name = st.text_input("Character name", value="Lemuel Gulliver")
+    char_prompt = st.text_area(
+        "Character master prompt",
+        value=(
+            "Lemuel Gulliver, an English ship’s surgeon and seasoned traveler in the early 1700s, "
+            "lean build and weathered seafarer’s face, medium-length dark hair, clean-shaven or faint stubble, "
+            "wearing period-accurate voyager clothing: dark long coat, waistcoat, linen shirt, neck cloth, breeches, "
+            "stockings, buckled shoes, with a leather satchel and nautical wear and tear appropriate to harsh voyages. "
+            "Realistic charcoal drawing with subtle colored chalk accents (muted blues, reds, ochres), textured paper grain, "
+            "high detail, lifelike eyes and shading, slightly glossy highlights, full body cutout, no background, no shadow, no text."
+        ),
+        height=180,
     )
 
-    chars = _parse_canonical_characters(pasted_c)
-    if not chars:
-        st.warning("No canonical characters parsed yet. Paste the 'Canonical Master Prompts' section (with names + paragraphs).")
-        character_name = st.text_input("Character name (manual)", value="Custom Character")
-        character_prompt = st.text_area("Character prompt (manual)", value="", height=180)
-    else:
-        character_name = st.selectbox("Pick a character", options=list(chars.keys()))
-        character_prompt = chars[character_name]
-        st.code(character_prompt, language="text")
+    st.info("Tip: For character training, use aspect ratio 1:1 in the sidebar.")
 
-    negative_text_c = st.text_input(
-        "Negative prompt (optional)",
-        value="text, watermark, logo, signature, blurry, low quality, extra fingers, deformed",
-    )
+    colX, colY = st.columns([1, 1])
+    with colX:
+        preview_pack = st.button("Preview Pack (first image)", type="primary")
+    with colY:
+        run_pack = st.button("Generate Full Pack")
 
-    st.markdown("**Pack outputs**")
-    pack = st.multiselect(
-        "Select outputs",
-        ["Full body neutral pose", "Face front (straight)", "Face 45 degrees", "Face profile"],
-        default=["Full body neutral pose", "Face front (straight)", "Face 45 degrees", "Face profile"],
-    )
+    ref_bytes = ref_img.read() if ref_img is not None else None
 
-    samples_c = st.slider("Images per output", 1, 8, 2)
-    width_c, height_c = 1024, 1024
+    pack_items = _make_character_training_prompts(char_name, char_prompt)
 
-    run_char_preview = st.button("Generate character preview", type="primary", disabled=(not stability_key))
-    run_char_batch = st.button("Generate character pack", disabled=(not stability_key))
+    st.write("Pack will generate:")
+    for it in pack_items:
+        st.code(f"{it.file_base}: {it.prompt[:120]}...", language="text")
 
-    if (run_char_preview or run_char_batch) and stability_key:
-        if not character_prompt.strip():
-            st.error("Character prompt is empty.")
-        else:
-            stability_api = _init_stability(engine=engine, key=stability_key)
+    if preview_pack:
+        try:
+            img_bytes = _stability_generate_one(
+                api_key=api_key,
+                endpoint=endpoint,
+                prompt=pack_items[0].prompt,
+                negative_prompt=negative_prompt,
+                aspect_ratio=aspect_ratio,
+                output_format=output_format,
+                seed=int(seed) if seed is not None else None,
+                reference_image_bytes=ref_bytes,
+                image_denoise=float(image_denoise),
+            )
+            st.image(_bytes_to_pil(img_bytes), caption=pack_items[0].file_base, use_container_width=True)
+        except Exception as e:
+            st.error(str(e))
 
-            # Build prompt variants
-            variants: List[Tuple[str, str]] = []
-            base = character_prompt.strip()
+    if run_pack:
+        named: List[Tuple[str, bytes]] = []
+        total = len(pack_items) * variants
+        done = 0
+        progress = st.progress(0)
 
-            safe_base_name = _safe_filename(character_name)
+        cols = st.columns(4)
+        shown = 0
 
-            if "Full body neutral pose" in pack:
-                variants.append((
-                    f"{safe_base_name}_fullbody",
-                    base + "\nNeutral standing pose, arms relaxed, full body centered, consistent proportions, clean silhouette."
-                ))
-            if "Face front (straight)" in pack:
-                variants.append((
-                    f"{safe_base_name}_face_front",
-                    base + "\nTight head-and-shoulders portrait, face straight toward camera, neutral expression, high detail eyes."
-                ))
-            if "Face 45 degrees" in pack:
-                variants.append((
-                    f"{safe_base_name}_face_45",
-                    base + "\nTight head-and-shoulders portrait, face turned 45 degrees, neutral expression, consistent facial structure."
-                ))
-            if "Face profile" in pack:
-                variants.append((
-                    f"{safe_base_name}_face_profile",
-                    base + "\nTight head-and-shoulders portrait, full profile view, neutral expression, clear nose and jawline."
-                ))
+        for it in pack_items:
+            for v in range(variants):
+                try:
+                    img_bytes = _stability_generate_one(
+                        api_key=api_key,
+                        endpoint=endpoint,
+                        prompt=it.prompt,
+                        negative_prompt=negative_prompt,
+                        aspect_ratio=aspect_ratio,
+                        output_format=output_format,
+                        seed=(int(seed) + v) if seed is not None else None,
+                        reference_image_bytes=ref_bytes,
+                        image_denoise=float(image_denoise),
+                    )
+                    fname = f"{it.file_base}_v{v+1:02d}.{output_format}"
+                    named.append((fname, img_bytes))
 
-            named_images: List[Tuple[str, Image.Image]] = []
-            prog = st.progress(0)
-            total = len(variants)
+                    if shown < 8:
+                        with cols[shown % 4]:
+                            st.image(_bytes_to_pil(img_bytes), caption=fname, use_container_width=True)
+                        shown += 1
 
-            for idx, (stem, prompt_txt) in enumerate(variants, start=1):
-                st.markdown(f"### {stem}")
-                st.code(prompt_txt, language="text")
+                except Exception as e:
+                    st.error(f"{it.file_base} v{v+1} failed: {e}")
 
-                imgs = _generate_images(
-                    stability_api=stability_api,
-                    positive_text=prompt_txt,
-                    negative_text=negative_text_c,
-                    width=width_c,
-                    height=height_c,
-                    samples=(1 if run_char_preview else samples_c),
-                    steps=steps,
-                    cfg_scale=cfg_scale,
-                    seed=seed,
-                    init_image=init_image,
-                    start_schedule=start_schedule,
-                    use_style_preset=use_style_preset,
-                    style_preset=style_preset,
-                )
+                done += 1
+                progress.progress(done / max(1, total))
 
-                if not imgs:
-                    st.error("No images returned (possible safety filter or API error). Check Streamlit logs.")
-                else:
-                    cols = st.columns(min(4, len(imgs)))
-                    for i, img in enumerate(imgs):
-                        fname = f"{stem}_v{str(i+1).zfill(2)}.png"
-                        named_images.append((fname, img))
-                        with cols[i % len(cols)]:
-                            st.image(img, caption=fname, use_container_width=True)
-
-                prog.progress(int((idx / total) * 100))
-
-            if named_images:
-                zip_bytes = _zip_images(named_images)
-                st.download_button(
-                    "Download ZIP",
-                    data=zip_bytes,
-                    file_name="outpaged_character_pack.zip",
-                    mime="application/zip",
-                )
+        if named:
+            zip_bytes = _zip_images(named)
+            st.download_button(
+                "Download ZIP",
+                data=zip_bytes,
+                file_name=f"{re.sub(r'[^a-zA-Z0-9_-]+','_',char_name).lower()}_training_pack.zip",
+                mime="application/zip",
+            )
