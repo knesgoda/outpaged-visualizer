@@ -319,6 +319,25 @@ def read_docx_text(uploaded_file) -> str:
     paragraphs = [p.text.strip() for p in document.paragraphs if p.text.strip()]
     return "\n".join(paragraphs)
 
+def _sanitize_prompt_text(text: str) -> str:
+    cleaned = re.sub(
+        r"\bstreetview,\s*viewer standing at the\b",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s*,\s*,\s*", ", ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip(" ,;-")
+
+def _split_prompt_and_negative(text: str) -> tuple[str, str]:
+    match = re.search(r"\bnegative prompt\b\s*:?", text, flags=re.IGNORECASE)
+    if not match:
+        return _sanitize_prompt_text(text), ""
+    prompt_part = text[:match.start()].strip()
+    negative_part = text[match.end():].strip()
+    return _sanitize_prompt_text(prompt_part), negative_part.strip(" ,;-")
+
 def parse_prompt_blocks(text: str, label_patterns: list[str]) -> list[dict]:
     items: list[dict] = []
     current_name: str | None = None
@@ -336,10 +355,13 @@ def parse_prompt_blocks(text: str, label_patterns: list[str]) -> list[dict]:
                 break
         if match:
             if current_name:
+                raw_text = " ".join(l for l in current_lines if l.strip()).strip()
+                prompt_text, negative_text = _split_prompt_and_negative(raw_text)
                 items.append(
                     {
                         "filename": current_name,
-                        "prompt": "\n".join(l for l in current_lines if l.strip()).strip(),
+                        "prompt": prompt_text,
+                        "negative_prompt": negative_text,
                     }
                 )
             current_name = match.group("filename").strip()
@@ -347,10 +369,13 @@ def parse_prompt_blocks(text: str, label_patterns: list[str]) -> list[dict]:
         elif current_name:
             current_lines.append(line)
     if current_name:
+        raw_text = " ".join(l for l in current_lines if l.strip()).strip()
+        prompt_text, negative_text = _split_prompt_and_negative(raw_text)
         items.append(
             {
                 "filename": current_name,
-                "prompt": "\n".join(l for l in current_lines if l.strip()).strip(),
+                "prompt": prompt_text,
+                "negative_prompt": negative_text,
             }
         )
     return [item for item in items if item["filename"] and item["prompt"]]
@@ -393,8 +418,20 @@ with tabs[0]:
     )
     st.write(f"Parsed backgrounds: {len(bg_items)}")
     if bg_items:
+        show_bg_negative = any(item.get("negative_prompt") for item in bg_items)
         st.dataframe(
-            [{"filename": item["filename"], "prompt": item["prompt"][:120]} for item in bg_items],
+            [
+                {
+                    "filename": item["filename"],
+                    "prompt": item["prompt"][:120],
+                    **(
+                        {"negative_prompt": item["negative_prompt"][:120]}
+                        if show_bg_negative
+                        else {}
+                    ),
+                }
+                for item in bg_items
+            ],
             use_container_width=True,
             hide_index=True,
         )
@@ -459,10 +496,11 @@ with tabs[0]:
             try:
                 for idx, item in enumerate(items_to_run):
                     seed = build_seed(bg_seed, idx)
+                    negative_prompt = item.get("negative_prompt") or bg_negative.strip()
                     status.write(f"Generating {item['filename']}…")
                     images = stability_generate_images(
                         prompt=item["prompt"],
-                        negative_prompt=bg_negative.strip(),
+                        negative_prompt=negative_prompt,
                         seed=seed,
                         aspect_ratio=bg_aspect,
                         image_count=bg_count,
@@ -524,8 +562,20 @@ with tabs[1]:
     )
     st.write(f"Parsed characters: {len(char_items)}")
     if char_items:
+        show_char_negative = any(item.get("negative_prompt") for item in char_items)
         st.dataframe(
-            [{"filename": item["filename"], "prompt": item["prompt"][:120]} for item in char_items],
+            [
+                {
+                    "filename": item["filename"],
+                    "prompt": item["prompt"][:120],
+                    **(
+                        {"negative_prompt": item["negative_prompt"][:120]}
+                        if show_char_negative
+                        else {}
+                    ),
+                }
+                for item in char_items
+            ],
             use_container_width=True,
             hide_index=True,
         )
@@ -629,10 +679,11 @@ with tabs[1]:
                         seed_offset = item_index * 100 + variant_index * 10
                         seed = build_seed(char_seed, seed_offset)
                         view_prompt = f"{item['prompt']}, {variant_suffix}"
+                        negative_prompt = item.get("negative_prompt") or char_negative.strip()
                         status.write(f"Generating {item['filename']} {variant_key}…")
                         images = stability_generate_images(
                             prompt=view_prompt,
-                            negative_prompt=char_negative.strip(),
+                            negative_prompt=negative_prompt,
                             seed=seed,
                             aspect_ratio=char_aspect,
                             image_count=char_count,
@@ -708,8 +759,20 @@ with tabs[2]:
         )
         st.write(f"Parsed skyboxes: {len(skybox_items)}")
         if skybox_items:
+            show_skybox_negative = any(item.get("negative_prompt") for item in skybox_items)
             st.dataframe(
-                [{"filename": item["filename"], "prompt": item["prompt"][:120]} for item in skybox_items],
+                [
+                    {
+                        "filename": item["filename"],
+                        "prompt": item["prompt"][:120],
+                        **(
+                            {"negative_prompt": item["negative_prompt"][:120]}
+                            if show_skybox_negative
+                            else {}
+                        ),
+                    }
+                    for item in skybox_items
+                ],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -781,11 +844,12 @@ with tabs[2]:
                 try:
                     for idx, item in enumerate(items_to_run):
                         skybox_seed = build_seed(int(seed), idx)
+                        negative_text = item.get("negative_prompt") or negative
                         status.write(f"Generating {item['filename']}…")
                         gen = blockade_generate_skybox(
                             prompt=item["prompt"],
                             style_id=style_id,
-                            negative_text=negative,
+                            negative_text=negative_text,
                             seed=skybox_seed,
                             enhance_prompt=enhance,
                             init_image_b64=init_b64,
@@ -923,13 +987,15 @@ with tabs[2]:
             init_b64 = _b64_of_uploaded_file(init_img) if init_img else None
             control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
             skybox_seed = None if seed == 0 else int(seed)
+            prompt_text, prompt_negative = _split_prompt_and_negative(prompt)
+            negative_text = prompt_negative or negative
 
             with st.status("Generating skybox…", expanded=True) as status:
                 try:
                     gen = blockade_generate_skybox(
-                        prompt=prompt,
+                        prompt=prompt_text,
                         style_id=style_id,
-                        negative_text=negative,
+                        negative_text=negative_text,
                         seed=skybox_seed,
                         enhance_prompt=enhance,
                         init_image_b64=init_b64,
