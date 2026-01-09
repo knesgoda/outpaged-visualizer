@@ -163,38 +163,51 @@ if gen_btn:
     control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
 
     with st.status("Generating skybox…", expanded=True) as status:
-        gen = blockade_generate_skybox(
-            prompt=prompt,
-            style_id=style_id,
-            negative_text=negative,
-            seed=int(seed),
-            enhance_prompt=enhance,
-            init_image_b64=init_b64,
-            init_strength=float(init_strength),
-            control_image_b64=control_b64,
-            control_model="remix",
-        )
-        skybox_oid = gen["obfuscated_id"]
-        status.write(f"Generation started. obfuscated_id: {skybox_oid}")
+        try:
+            gen = blockade_generate_skybox(
+                prompt=prompt,
+                style_id=style_id,
+                negative_text=negative,
+                seed=int(seed),
+                enhance_prompt=enhance,
+                init_image_b64=init_b64,
+                init_strength=float(init_strength),
+                control_image_b64=control_b64,
+                control_model="remix",
+            )
+            skybox_oid = gen["obfuscated_id"]
+            status.write(f"Generation started. obfuscated_id: {skybox_oid}")
 
-        done = blockade_poll_generation(skybox_oid)
-        status.write("Skybox complete. Fetching base image…")
-        skybox_png = download_url_bytes(done["file_url"])
+            done = blockade_poll_generation(skybox_oid)
+            status.write("Skybox complete. Fetching base image…")
+            skybox_png = download_url_bytes(done["file_url"])
 
-        st.image(skybox_png, caption="Skybox (equirectangular preview)", use_container_width=True)
-        st.download_button("Download equirectangular (base)", data=skybox_png, file_name="skybox_equirectangular_base.png", mime="image/png")
+            st.image(skybox_png, caption="Skybox (equirectangular preview)", use_container_width=True)
+            st.download_button("Download equirectangular (base)", data=skybox_png, file_name="skybox_equirectangular_base.png", mime="image/png")
 
-        status.write("Requesting exports…")
-        exp_png = blockade_request_export(skybox_oid, type_id=export_png_type_id, resolution_id=resolution_id)
-        exp_cube = blockade_request_export(skybox_oid, type_id=export_cubemap_type_id, resolution_id=resolution_id)
+            status.write("Requesting exports…")
+            exp_png = blockade_request_export(skybox_oid, type_id=export_png_type_id, resolution_id=resolution_id)
+            exp_cube = blockade_request_export(skybox_oid, type_id=export_cubemap_type_id, resolution_id=resolution_id)
 
-        exp_png_done = blockade_poll_export(exp_png["id"])
-        exp_cube_done = blockade_poll_export(exp_cube["id"])
+            exp_png_done = blockade_poll_export(exp_png["id"])
+            exp_cube_done = blockade_poll_export(exp_cube["id"])
 
-        png_bytes = download_url_bytes(exp_png_done["file_url"])
-        cube_bytes = download_url_bytes(exp_cube_done["file_url"])
+            png_bytes = download_url_bytes(exp_png_done["file_url"])
+            cube_bytes = download_url_bytes(exp_cube_done["file_url"])
 
-        st.download_button("Download equirectangular PNG (export)", data=png_bytes, file_name=f"skybox_{res_choice}_equirectangular.png", mime="image/png")
-        st.download_button("Download cubemap (export)", data=cube_bytes, file_name=f"skybox_{res_choice}_cubemap.zip", mime="application/zip")
+            st.download_button("Download equirectangular PNG (export)", data=png_bytes, file_name=f"skybox_{res_choice}_equirectangular.png", mime="image/png")
+            st.download_button("Download cubemap (export)", data=cube_bytes, file_name=f"skybox_{res_choice}_cubemap.zip", mime="application/zip")
 
-        status.update(label="Done", state="complete", expanded=False)
+            status.update(label="Done", state="complete", expanded=False)
+        except requests.exceptions.RequestException as exc:
+            status.update(label="Failed", state="error", expanded=True)
+            st.error(f"Request failed while generating the skybox: {exc}")
+            st.exception(exc)
+        except RuntimeError as exc:
+            status.update(label="Failed", state="error", expanded=True)
+            st.error(f"Skybox generation failed: {exc}")
+            st.exception(exc)
+        except TimeoutError as exc:
+            status.update(label="Failed", state="error", expanded=True)
+            st.error(f"Skybox generation timed out: {exc}")
+            st.exception(exc)
