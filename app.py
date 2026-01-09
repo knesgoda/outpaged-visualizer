@@ -343,6 +343,61 @@ char_prompt = st.text_area(
     "Character prompt",
     "A stylized sci-fi explorer, full body, detailed outfit, neutral pose, consistent lighting, plain studio background",
 )
+view_options = {
+    "Front": "front",
+    "3/4": "three-quarter",
+    "Profile": "side profile",
+    "Back": "back",
+    "T-pose": "T-pose",
+}
+selected_view_labels = st.multiselect(
+    "Views to generate",
+    list(view_options.keys()),
+    default=["Front", "3/4", "Profile", "Back"],
+    help="Select one or more views to include in the training set.",
+)
+lock_seed = st.checkbox(
+    "Lock seed across views",
+    value=True,
+    help="When off, each view will use a random seed for more variety.",
+)
+st.markdown("**Prompt builder**")
+turnaround_fragment = st.checkbox(
+    "Add turnaround fragment",
+    value=True,
+    help="Adds a consistent turnaround phrase covering common views and pose.",
+)
+lighting_fragment = st.checkbox(
+    "Add lighting/background fragment",
+    value=True,
+    help="Adds neutral lighting and plain background guidance.",
+)
+training_fragment = st.checkbox(
+    "Add training boilerplate fragment",
+    value=True,
+    help="Adds full-body, turntable training, and neutral pose guidance.",
+)
+prompt_fragments = []
+if turnaround_fragment:
+    prompt_fragments.append("turnaround: front, three-quarter, profile, back, T-pose")
+if lighting_fragment:
+    prompt_fragments.append("neutral lighting, orthographic look, plain background")
+if training_fragment:
+    prompt_fragments.append("full-body character, turntable training image, neutral pose, consistent lighting")
+
+default_prompt_builder = ", ".join(
+    [segment for segment in [char_prompt.strip(), *prompt_fragments] if segment]
+).strip()
+reset_prompt_builder = st.button("Reset prompt builder to defaults", use_container_width=True)
+if "prompt_builder" not in st.session_state or reset_prompt_builder:
+    st.session_state.prompt_builder = default_prompt_builder
+prompt_builder = st.text_area(
+    "Prompt builder (editable)",
+    key="prompt_builder",
+    height=120,
+    help="Edit this prompt to fit your character style. View-specific text is appended automatically.",
+)
+st.caption("Tip: edit the prompt builder to fine-tune your character style. Use reset if you change fragments.")
 char_negative = st.text_input(
     "Negative prompt",
     "text, watermark, logo, blurry, low quality, cropped, extra limbs",
@@ -354,23 +409,14 @@ aspect_ratio = st.selectbox(
     index=0,
 )
 image_count = st.slider("Images per view", min_value=1, max_value=4, value=2)
-view_set_label = st.selectbox(
-    "View set",
-    ["Front view", "Side view", "Back view", "Front/Side/Back", "3-4 view set"],
-    index=3,
-)
-
-view_sets = {
-    "Front view": ["front"],
-    "Side view": ["side profile"],
-    "Back view": ["back"],
-    "Front/Side/Back": ["front", "side profile", "back"],
-    "3-4 view set": ["front", "side profile", "back", "three-quarter"],
-}
 
 char_btn = st.button("Generate Character Views", type="primary", use_container_width=True)
 
 if char_btn:
+    selected_views = [view_options[label] for label in selected_view_labels]
+    if not selected_views:
+        st.error("Please select at least one view to generate.")
+        st.stop()
     try:
         stability_api_key = st.secrets["STABILITY_API_KEY"]
     except KeyError:
@@ -381,16 +427,15 @@ if char_btn:
         all_images: list[tuple[str, bytes]] = []
         with st.status("Generating character views…", expanded=True) as status:
             try:
-                for view in view_sets[view_set_label]:
+                for view in selected_views:
                     view_prompt = (
-                        f"{char_prompt.strip()}, {view} view, full-body character, "
-                        "turntable training image, consistent lighting, neutral pose, plain background"
+                        f"{prompt_builder.strip()}, {view} view"
                     )
                     status.write(f"Requesting {view} view…")
                     images = stability_generate_images(
                         prompt=view_prompt,
                         negative_prompt=char_negative.strip(),
-                        seed=char_seed if char_seed > 0 else None,
+                        seed=(char_seed if char_seed > 0 else None) if lock_seed else None,
                         aspect_ratio=aspect_ratio,
                         image_count=image_count,
                         api_key=stability_api_key,
