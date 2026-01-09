@@ -374,7 +374,7 @@ with tabs[0]:
 
     bg_items = parse_prompt_blocks(
         bg_text,
-        [r"background file name\s*:\s*(?P<filename>\S+)"],
+        [r"background file name\s*:\s*(?P<filename>.+)"],
     )
     st.write(f"Parsed backgrounds: {len(bg_items)}")
     if bg_items:
@@ -501,10 +501,10 @@ with tabs[1]:
     char_items = parse_prompt_blocks(
         char_text,
         [
-            r"character name\s*/\s*file name\s*:\s*(?P<filename>\S+)",
-            r"character file name\s*:\s*(?P<filename>\S+)",
-            r"character filename\s*:\s*(?P<filename>\S+)",
-            r"file name\s*:\s*(?P<filename>\S+)",
+            r"character name\s*/\s*file name\s*:\s*(?P<filename>.+)",
+            r"character file name\s*:\s*(?P<filename>.+)",
+            r"character filename\s*:\s*(?P<filename>.+)",
+            r"file name\s*:\s*(?P<filename>.+)",
         ],
     )
     st.write(f"Parsed characters: {len(char_items)}")
@@ -684,7 +684,12 @@ with tabs[2]:
 
         skybox_items = parse_prompt_blocks(
             skybox_text,
-            [r"skybox file name\s*:\s*(?P<filename>\S+)"],
+            [
+                r"skybox name\s*/\s*file name\s*:\s*(?P<filename>.+)",
+                r"skybox file name\s*:\s*(?P<filename>.+)",
+                r"skybox filename\s*:\s*(?P<filename>.+)",
+                r"file name\s*:\s*(?P<filename>.+)",
+            ],
         )
         st.write(f"Parsed skyboxes: {len(skybox_items)}")
         if skybox_items:
@@ -694,7 +699,10 @@ with tabs[2]:
                 hide_index=True,
             )
         else:
-            st.info("No skybox entries parsed yet. Ensure your DOCX includes 'Skybox file name: <name>'.")
+            st.info(
+                "No skybox entries parsed yet. Ensure your DOCX includes "
+                "'Skybox file name: <name>' or 'Skybox filename: <name>'."
+            )
 
         st.markdown("**Single prompt**")
         prompt = st.text_area(
