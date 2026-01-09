@@ -173,6 +173,16 @@ def stability_headers(api_key: str) -> dict:
         "accept": "application/json",
     }
 
+def stability_api_key() -> str:
+    api_key = st.secrets.get("STABILITY_API_KEY", "")
+    if not api_key:
+        st.error(
+            "Missing STABILITY_API_KEY in Streamlit Secrets. The key needs access to "
+            "Stability.ai Stable Image Core (v2beta) generation."
+        )
+        st.stop()
+    return api_key
+
 def stability_generate_images(
     prompt: str,
     negative_prompt: str,
@@ -338,6 +348,10 @@ st.divider()
 # ---------------- UI: Character Training Images (Stability.ai) ----------------
 
 st.subheader("🧍 Character Training Images (Stability.ai)")
+st.caption(
+    "Requires Streamlit Secret STABILITY_API_KEY with permission to call "
+    "Stability.ai Stable Image Core (v2beta) image generation."
+)
 
 char_prompt = st.text_area(
     "Character prompt",
@@ -417,60 +431,53 @@ if char_btn:
     if not selected_views:
         st.error("Please select at least one view to generate.")
         st.stop()
-    try:
-        stability_api_key = st.secrets["STABILITY_API_KEY"]
-    except KeyError:
-        st.error("Missing STABILITY_API_KEY in Streamlit Secrets.")
-        stability_api_key = None
+    stability_key = stability_api_key()
 
-    if stability_api_key:
-        all_images: list[tuple[str, bytes]] = []
-        with st.status("Generating character views…", expanded=True) as status:
-            try:
-                for view in selected_views:
-                    view_prompt = (
-                        f"{prompt_builder.strip()}, {view} view"
-                    )
-                    status.write(f"Requesting {view} view…")
-                    images = stability_generate_images(
-                        prompt=view_prompt,
-                        negative_prompt=char_negative.strip(),
-                        seed=(char_seed if char_seed > 0 else None) if lock_seed else None,
-                        aspect_ratio=aspect_ratio,
-                        image_count=image_count,
-                        api_key=stability_api_key,
-                    )
-                    for idx, image_bytes in enumerate(images, start=1):
-                        filename = f"character_{view.replace(' ', '_')}_{idx}.png"
-                        all_images.append((filename, image_bytes))
+    all_images: list[tuple[str, bytes]] = []
+    with st.status("Generating character views…", expanded=True) as status:
+        try:
+            for view in selected_views:
+                view_prompt = f"{prompt_builder.strip()}, {view} view"
+                status.write(f"Requesting {view} view…")
+                images = stability_generate_images(
+                    prompt=view_prompt,
+                    negative_prompt=char_negative.strip(),
+                    seed=(char_seed if char_seed > 0 else None) if lock_seed else None,
+                    aspect_ratio=aspect_ratio,
+                    image_count=image_count,
+                    api_key=stability_key,
+                )
+                for idx, image_bytes in enumerate(images, start=1):
+                    filename = f"character_{view.replace(' ', '_')}_{idx}.png"
+                    all_images.append((filename, image_bytes))
 
-                for filename, image_bytes in all_images:
-                    st.image(image_bytes, caption=filename, use_container_width=True)
-                    st.download_button(
-                        f"Download {filename}",
-                        data=image_bytes,
-                        file_name=filename,
-                        mime="image/png",
-                    )
-
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                    for filename, image_bytes in all_images:
-                        zip_file.writestr(filename, image_bytes)
-                zip_buffer.seek(0)
+            for filename, image_bytes in all_images:
+                st.image(image_bytes, caption=filename, use_container_width=True)
                 st.download_button(
-                    "Download all images (ZIP)",
-                    data=zip_buffer,
-                    file_name="character_training_images.zip",
-                    mime="application/zip",
+                    f"Download {filename}",
+                    data=image_bytes,
+                    file_name=filename,
+                    mime="image/png",
                 )
 
-                status.update(label="Done", state="complete", expanded=False)
-            except requests.exceptions.RequestException as exc:
-                status.update(label="Failed", state="error", expanded=True)
-                st.error(f"Request failed while generating images: {exc}")
-                st.exception(exc)
-            except RuntimeError as exc:
-                status.update(label="Failed", state="error", expanded=True)
-                st.error(f"Image generation failed: {exc}")
-                st.exception(exc)
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                for filename, image_bytes in all_images:
+                    zip_file.writestr(filename, image_bytes)
+            zip_buffer.seek(0)
+            st.download_button(
+                "Download all images (ZIP)",
+                data=zip_buffer,
+                file_name="character_training_images.zip",
+                mime="application/zip",
+            )
+
+            status.update(label="Done", state="complete", expanded=False)
+        except requests.exceptions.RequestException as exc:
+            status.update(label="Failed", state="error", expanded=True)
+            st.error(f"Request failed while generating images: {exc}")
+            st.exception(exc)
+        except RuntimeError as exc:
+            status.update(label="Failed", state="error", expanded=True)
+            st.error(f"Image generation failed: {exc}")
+            st.exception(exc)
