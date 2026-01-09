@@ -176,7 +176,21 @@ def blockade_poll_generation(obfuscated_id: str, sleep_s: float = 2.0, max_wait_
     waited = 0
     while waited < max_wait_s:
         r = requests.get(url, headers=headers, timeout=60)
-        r.raise_for_status()
+        if r.status_code == 404:
+            time.sleep(sleep_s)
+            waited += sleep_s
+            continue
+        try:
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            detail = r.text
+            try:
+                detail = r.json()
+            except ValueError:
+                pass
+            raise RuntimeError(
+                f"Skybox status request failed ({r.status_code}): {detail}"
+            ) from exc
         data = r.json()
         if data.get("status") == "complete" and data.get("file_url"):
             return data
