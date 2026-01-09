@@ -49,7 +49,7 @@ def blockade_get_styles(model_version: int = 3, api_key: str = ""):
 def blockade_get_export_types(api_key: str = ""):
     endpoints = (
         "skybox/export-types",
-        "skybox/export/types",
+        "skybox/exports/types",
     )
     last_error: RuntimeError | None = None
     for endpoint in endpoints:
@@ -289,43 +289,84 @@ with colB:
 try:
     export_meta = blockade_get_export_types(api_key=headers["x-api-key"])
 except (requests.exceptions.RequestException, RuntimeError) as exc:
-    st.error(f"Unable to load Blockade export types: {exc}")
-    st.stop()
-export_types = _extract_export_types(export_meta)
-export_type_ids = _build_label_index(export_types)
-
-expected_export_labels = {
-    "equirectangular-png": "equirectangular-png",
-    "cube-map-default-png": "cube-map-default-png",
-}
-missing_export_labels = [
-    label for label in expected_export_labels.values() if label not in export_type_ids
-]
-if missing_export_labels:
-    st.error(
-        "Export types response missing expected labels: "
-        f"{', '.join(missing_export_labels)}. Please refresh or check the API response."
+    export_meta = None
+    st.warning(
+        "Unable to load Blockade export types. You can still generate a skybox, "
+        "or enter export type/resolution IDs manually."
     )
-    st.stop()
 
-export_png_type_id = export_type_ids[expected_export_labels["equirectangular-png"]]
-export_cubemap_type_id = export_type_ids[expected_export_labels["cube-map-default-png"]]
+exports_enabled_default = export_meta is not None
+exports_enabled = st.checkbox(
+    "Request exports (equirectangular PNG + cubemap ZIP)",
+    value=exports_enabled_default,
+    help="Disable if the export type metadata is unavailable.",
+)
 
-export_resolutions = _extract_export_resolutions(export_meta, export_types)
-export_resolution_ids = _build_label_index(export_resolutions)
-resolution_labels = ["2K", "4K", "8K", "16K"]
-missing_resolution_labels = [
-    label for label in resolution_labels if label not in export_resolution_ids
-]
-if missing_resolution_labels:
-    st.error(
-        "Export resolutions response missing expected labels: "
-        f"{', '.join(missing_resolution_labels)}. Please refresh or check the API response."
+export_png_type_id = None
+export_cubemap_type_id = None
+resolution_id = None
+res_choice = "custom"
+
+if export_meta is not None:
+    export_types = _extract_export_types(export_meta)
+    export_type_ids = _build_label_index(export_types)
+
+    expected_export_labels = {
+        "equirectangular-png": "equirectangular-png",
+        "cube-map-default-png": "cube-map-default-png",
+    }
+    missing_export_labels = [
+        label for label in expected_export_labels.values() if label not in export_type_ids
+    ]
+    if missing_export_labels:
+        st.error(
+            "Export types response missing expected labels: "
+            f"{', '.join(missing_export_labels)}. Please refresh or check the API response."
+        )
+        st.stop()
+
+    export_png_type_id = export_type_ids[expected_export_labels["equirectangular-png"]]
+    export_cubemap_type_id = export_type_ids[expected_export_labels["cube-map-default-png"]]
+
+    export_resolutions = _extract_export_resolutions(export_meta, export_types)
+    export_resolution_ids = _build_label_index(export_resolutions)
+    resolution_labels = ["2K", "4K", "8K", "16K"]
+    missing_resolution_labels = [
+        label for label in resolution_labels if label not in export_resolution_ids
+    ]
+    if missing_resolution_labels:
+        st.error(
+            "Export resolutions response missing expected labels: "
+            f"{', '.join(missing_resolution_labels)}. Please refresh or check the API response."
+        )
+        st.stop()
+
+    res_choice = st.selectbox("Export resolution", resolution_labels, index=2)
+    resolution_id = export_resolution_ids[res_choice]
+else:
+    st.info(
+        "Enter export type IDs from the Blockade API docs or dashboard if you want "
+        "to request exports."
     )
-    st.stop()
-
-res_choice = st.selectbox("Export resolution", resolution_labels, index=2)
-resolution_id = export_resolution_ids[res_choice]
+    export_png_type_id = st.number_input(
+        "Equirectangular PNG export type ID",
+        min_value=1,
+        value=1,
+        step=1,
+    )
+    export_cubemap_type_id = st.number_input(
+        "Cubemap ZIP export type ID",
+        min_value=1,
+        value=2,
+        step=1,
+    )
+    res_choice = st.text_input("Export resolution label (for filenames)", value="custom")
+    resolution_id = st.number_input(
+        "Export resolution ID",
+        min_value=1,
+        value=1,
+        step=1,
+    )
 
 gen_btn = st.button("Generate Skybox", type="primary", use_container_width=True)
 
@@ -356,18 +397,41 @@ if gen_btn:
             st.image(skybox_png, caption="Skybox (equirectangular preview)", use_container_width=True)
             st.download_button("Download equirectangular (base)", data=skybox_png, file_name="skybox_equirectangular_base.png", mime="image/png")
 
-            status.write("Requesting exports…")
-            exp_png = blockade_request_export(skybox_oid, type_id=export_png_type_id, resolution_id=resolution_id)
-            exp_cube = blockade_request_export(skybox_oid, type_id=export_cubemap_type_id, resolution_id=resolution_id)
+            if exports_enabled:
+                if export_png_type_id is None or export_cubemap_type_id is None or resolution_id is None:
+                    raise RuntimeError(
+                        "Export type metadata is unavailable. Disable exports or provide manual IDs."
+                    )
+                status.write("Requesting exports…")
+                exp_png = blockade_request_export(
+                    skybox_oid,
+                    type_id=export_png_type_id,
+                    resolution_id=resolution_id,
+                )
+                exp_cube = blockade_request_export(
+                    skybox_oid,
+                    type_id=export_cubemap_type_id,
+                    resolution_id=resolution_id,
+                )
 
-            exp_png_done = blockade_poll_export(exp_png["id"])
-            exp_cube_done = blockade_poll_export(exp_cube["id"])
+                exp_png_done = blockade_poll_export(exp_png["id"])
+                exp_cube_done = blockade_poll_export(exp_cube["id"])
 
-            png_bytes = download_url_bytes(exp_png_done["file_url"])
-            cube_bytes = download_url_bytes(exp_cube_done["file_url"])
+                png_bytes = download_url_bytes(exp_png_done["file_url"])
+                cube_bytes = download_url_bytes(exp_cube_done["file_url"])
 
-            st.download_button("Download equirectangular PNG (export)", data=png_bytes, file_name=f"skybox_{res_choice}_equirectangular.png", mime="image/png")
-            st.download_button("Download cubemap (export)", data=cube_bytes, file_name=f"skybox_{res_choice}_cubemap.zip", mime="application/zip")
+                st.download_button(
+                    "Download equirectangular PNG (export)",
+                    data=png_bytes,
+                    file_name=f"skybox_{res_choice}_equirectangular.png",
+                    mime="image/png",
+                )
+                st.download_button(
+                    "Download cubemap (export)",
+                    data=cube_bytes,
+                    file_name=f"skybox_{res_choice}_cubemap.zip",
+                    mime="application/zip",
+                )
 
             status.update(label="Done", state="complete", expanded=False)
         except requests.exceptions.RequestException as exc:
