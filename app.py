@@ -1,5 +1,7 @@
 import base64
+import io
 import time
+import zipfile
 import requests
 import streamlit as st
 
@@ -165,6 +167,56 @@ def download_url_bytes(url: str) -> bytes:
     r.raise_for_status()
     return r.content
 
+def stability_headers(api_key: str) -> dict:
+    return {
+        "authorization": f"Bearer {api_key}",
+        "accept": "application/json",
+    }
+
+def stability_generate_images(
+    prompt: str,
+    negative_prompt: str,
+    seed: int | None,
+    aspect_ratio: str,
+    image_count: int,
+    api_key: str,
+):
+    url = "https://api.stability.ai/v2beta/stable-image/generate/core"
+    payload = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "aspect_ratio": aspect_ratio,
+        "output_format": "png",
+        "samples": image_count,
+    }
+    if seed is not None:
+        payload["seed"] = int(seed)
+
+    resp = requests.post(url, headers=stability_headers(api_key), files=payload, timeout=180)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Stability.ai error {resp.status_code}: {resp.text}")
+
+    content_type = resp.headers.get("content-type", "")
+    if content_type.startswith("image/"):
+        return [resp.content]
+
+    if "application/zip" in content_type:
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zip_file:
+            return [zip_file.read(name) for name in zip_file.namelist()]
+
+    data = resp.json()
+    if "image" in data:
+        return [base64.b64decode(data["image"])]
+    if "images" in data:
+        return [base64.b64decode(item) for item in data["images"]]
+    if "artifacts" in data:
+        return [
+            base64.b64decode(item.get("base64") or item.get("image"))
+            for item in data["artifacts"]
+            if item.get("base64") or item.get("image")
+        ]
+    raise RuntimeError("Stability.ai response did not include images.")
+
 # ---------------- UI: Skybox Tab ----------------
 
 st.subheader("🌐 Skybox Generator (Blockade Labs)")
@@ -280,3 +332,100 @@ if gen_btn:
             status.update(label="Failed", state="error", expanded=True)
             st.error(f"Skybox generation timed out: {exc}")
             st.exception(exc)
+
+st.divider()
+
+# ---------------- UI: Character Training Images (Stability.ai) ----------------
+
+st.subheader("🧍 Character Training Images (Stability.ai)")
+
+char_prompt = st.text_area(
+    "Character prompt",
+    "A stylized sci-fi explorer, full body, detailed outfit, neutral pose, consistent lighting, plain studio background",
+)
+char_negative = st.text_input(
+    "Negative prompt",
+    "text, watermark, logo, blurry, low quality, cropped, extra limbs",
+)
+char_seed = st.number_input("Seed (leave 0 for random)", min_value=0, max_value=2147483647, value=0)
+aspect_ratio = st.selectbox(
+    "Aspect ratio",
+    ["1:1", "2:3", "3:2", "9:16", "16:9"],
+    index=0,
+)
+image_count = st.slider("Images per view", min_value=1, max_value=4, value=2)
+view_set_label = st.selectbox(
+    "View set",
+    ["Front view", "Side view", "Back view", "Front/Side/Back", "3-4 view set"],
+    index=3,
+)
+
+view_sets = {
+    "Front view": ["front"],
+    "Side view": ["side profile"],
+    "Back view": ["back"],
+    "Front/Side/Back": ["front", "side profile", "back"],
+    "3-4 view set": ["front", "side profile", "back", "three-quarter"],
+}
+
+char_btn = st.button("Generate Character Views", type="primary", use_container_width=True)
+
+if char_btn:
+    try:
+        stability_api_key = st.secrets["STABILITY_API_KEY"]
+    except KeyError:
+        st.error("Missing STABILITY_API_KEY in Streamlit Secrets.")
+        stability_api_key = None
+
+    if stability_api_key:
+        all_images: list[tuple[str, bytes]] = []
+        with st.status("Generating character views…", expanded=True) as status:
+            try:
+                for view in view_sets[view_set_label]:
+                    view_prompt = (
+                        f"{char_prompt.strip()}, {view} view, full-body character, "
+                        "turntable training image, consistent lighting, neutral pose, plain background"
+                    )
+                    status.write(f"Requesting {view} view…")
+                    images = stability_generate_images(
+                        prompt=view_prompt,
+                        negative_prompt=char_negative.strip(),
+                        seed=char_seed if char_seed > 0 else None,
+                        aspect_ratio=aspect_ratio,
+                        image_count=image_count,
+                        api_key=stability_api_key,
+                    )
+                    for idx, image_bytes in enumerate(images, start=1):
+                        filename = f"character_{view.replace(' ', '_')}_{idx}.png"
+                        all_images.append((filename, image_bytes))
+
+                for filename, image_bytes in all_images:
+                    st.image(image_bytes, caption=filename, use_container_width=True)
+                    st.download_button(
+                        f"Download {filename}",
+                        data=image_bytes,
+                        file_name=filename,
+                        mime="image/png",
+                    )
+
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                    for filename, image_bytes in all_images:
+                        zip_file.writestr(filename, image_bytes)
+                zip_buffer.seek(0)
+                st.download_button(
+                    "Download all images (ZIP)",
+                    data=zip_buffer,
+                    file_name="character_training_images.zip",
+                    mime="application/zip",
+                )
+
+                status.update(label="Done", state="complete", expanded=False)
+            except requests.exceptions.RequestException as exc:
+                status.update(label="Failed", state="error", expanded=True)
+                st.error(f"Request failed while generating images: {exc}")
+                st.exception(exc)
+            except RuntimeError as exc:
+                status.update(label="Failed", state="error", expanded=True)
+                st.error(f"Image generation failed: {exc}")
+                st.exception(exc)
