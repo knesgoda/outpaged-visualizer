@@ -125,7 +125,7 @@ def blockade_generate_skybox(
     prompt: str,
     style_id: int,
     negative_text: str = "",
-    seed: int = 0,
+    seed: int | None = 0,
     enhance_prompt: bool = False,
     init_image_b64: str | None = None,
     init_strength: float = 0.5,
@@ -142,7 +142,7 @@ def blockade_generate_skybox(
     }
     if negative_text.strip():
         payload["negative_text"] = negative_text.strip()
-    if seed is not None:
+    if isinstance(seed, int) and seed > 0:
         payload["seed"] = int(seed)
 
     # Prefer init_image if provided; control_image is more "structure only".
@@ -797,14 +797,15 @@ with tabs[2]:
         if gen_btn:
             init_b64 = _b64_of_uploaded_file(init_img) if init_img else None
             control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
-    
+            skybox_seed = None if seed == 0 else int(seed)
+
             with st.status("Generating skybox…", expanded=True) as status:
                 try:
                     gen = blockade_generate_skybox(
                         prompt=prompt,
                         style_id=style_id,
                         negative_text=negative,
-                        seed=int(seed),
+                        seed=skybox_seed,
                         enhance_prompt=enhance,
                         init_image_b64=init_b64,
                         init_strength=float(init_strength),
