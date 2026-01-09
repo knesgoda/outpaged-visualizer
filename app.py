@@ -47,20 +47,32 @@ def blockade_get_styles(model_version: int = 3, api_key: str = ""):
 
 @st.cache_data(ttl=3600)
 def blockade_get_export_types(api_key: str = ""):
-    url = f"{BLOCKADE_BASE}/skybox/export/types"
-    resp = requests.get(url, headers=blockade_headers(), timeout=60)
-    try:
-        resp.raise_for_status()
-    except requests.exceptions.HTTPError as exc:
-        detail = resp.text
+    endpoints = (
+        "skybox/export-types",
+        "skybox/export/types",
+    )
+    last_error: RuntimeError | None = None
+    for endpoint in endpoints:
+        url = f"{BLOCKADE_BASE}/{endpoint}"
+        resp = requests.get(url, headers=blockade_headers(), timeout=60)
         try:
-            detail = resp.json()
-        except ValueError:
-            pass
-        raise RuntimeError(
-            f"Blockade export types request failed ({resp.status_code}): {detail}"
-        ) from exc
-    return resp.json()
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            detail = resp.text
+            try:
+                detail = resp.json()
+            except ValueError:
+                pass
+            last_error = RuntimeError(
+                f"Blockade export types request failed ({resp.status_code}): {detail}"
+            )
+            if resp.status_code == 404:
+                continue
+            raise last_error from exc
+        return resp.json()
+    if last_error:
+        raise last_error
+    raise RuntimeError("Blockade export types request failed: no endpoints available.")
 
 def _build_label_index(items: list[dict] | None) -> dict[str, int]:
     label_index: dict[str, int] = {}
