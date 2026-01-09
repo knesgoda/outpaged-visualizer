@@ -67,6 +67,7 @@ def blockade_get_export_types(api_key: str = ""):
     endpoints = (
         "skybox/export-types",
         "skybox/exports/types",
+        "skybox/export/types",
     )
     last_error: RuntimeError | None = None
     for endpoint in endpoints:
