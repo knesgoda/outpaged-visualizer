@@ -21,10 +21,15 @@ def blockade_headers() -> dict:
     }
 
 @st.cache_data(ttl=3600)
-def blockade_get_styles(model_version: int = 3):
+def blockade_get_styles(model_version: int = 3, api_key: str = ""):
     # Docs: Get Skybox Styles. :contentReference[oaicite:10]{index=10}
     url = f"{BLOCKADE_BASE}/skybox/styles"
-    resp = requests.get(url, headers={"x-api-key": st.secrets["BLOCKADE_API_KEY"], "accept": "application/json"}, params={"model_version": model_version}, timeout=60)
+    resp = requests.get(
+        url,
+        headers=blockade_headers(),
+        params={"model_version": model_version},
+        timeout=60,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -69,7 +74,7 @@ def blockade_poll_generation(obfuscated_id: str, sleep_s: float = 2.0, max_wait_
     # Docs mention tracking generation progress; you can poll by obfuscated id. :contentReference[oaicite:13]{index=13}
     # Endpoint shown in docs nav: "Get Skybox by Obfuscated id"
     url = f"{BLOCKADE_BASE}/skybox/{obfuscated_id}"
-    headers = {"x-api-key": st.secrets["BLOCKADE_API_KEY"], "accept": "application/json"}
+    headers = blockade_headers()
     waited = 0
     while waited < max_wait_s:
         r = requests.get(url, headers=headers, timeout=60)
@@ -100,7 +105,7 @@ def blockade_request_export(skybox_obfuscated_id: str, type_id: int, resolution_
 def blockade_poll_export(export_id: str, sleep_s: float = 2.0, max_wait_s: int = 300):
     # Docs: GET /skybox/export/{export.id} returns file_url + status. :contentReference[oaicite:15]{index=15}
     url = f"{BLOCKADE_BASE}/skybox/export/{export_id}"
-    headers = {"x-api-key": st.secrets["BLOCKADE_API_KEY"], "accept": "application/json"}
+    headers = blockade_headers()
     waited = 0
     while waited < max_wait_s:
         r = requests.get(url, headers=headers, timeout=60)
@@ -123,7 +128,8 @@ def download_url_bytes(url: str) -> bytes:
 
 st.subheader("🌐 Skybox Generator (Blockade Labs)")
 
-styles = blockade_get_styles(model_version=3)
+headers = blockade_headers()
+styles = blockade_get_styles(model_version=3, api_key=headers["x-api-key"])
 style_options = {f"{s['name']} (id {s['id']})": s["id"] for s in styles}
 style_label = st.selectbox("Skybox Style (Model 3)", list(style_options.keys()))
 style_id = style_options[style_label]
