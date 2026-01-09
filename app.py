@@ -663,7 +663,36 @@ with tabs[2]:
         style_options = {f"{s['name']} (id {s['id']})": s["id"] for s in styles}
         style_label = st.selectbox("Skybox Style (Model 3)", list(style_options.keys()), key="skybox_style")
         style_id = style_options[style_label]
-    
+
+        st.caption("Upload your skybox prompts DOCX or paste the text directly.")
+        skybox_doc = st.file_uploader(
+            "Skybox DOCX",
+            type=["docx"],
+            key="skybox_docx",
+        )
+        skybox_text_default = read_docx_text(skybox_doc) if skybox_doc else ""
+        skybox_text = st.text_area(
+            "Skybox prompt text",
+            value=skybox_text_default,
+            height=200,
+            key="skybox_text",
+        )
+
+        skybox_items = parse_prompt_blocks(
+            skybox_text,
+            [r"skybox file name\s*:\s*(?P<filename>\S+)"],
+        )
+        st.write(f"Parsed skyboxes: {len(skybox_items)}")
+        if skybox_items:
+            st.dataframe(
+                [{"filename": item["filename"], "prompt": item["prompt"][:120]} for item in skybox_items],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No skybox entries parsed yet. Ensure your DOCX includes 'Skybox file name: <name>'.")
+
+        st.markdown("**Single prompt**")
         prompt = st.text_area(
             "Skybox Prompt",
             "Laputan observatory walkway under cold sky light, chalk-marked geometric diagrams, star charts, brass instruments, vivid chalk pastel look",
@@ -702,6 +731,75 @@ with tabs[2]:
             )
             st.caption("Control image preserves structure/perspective more than color. Requires control_model='remix'.")
     
+        preview_skybox = st.button(
+            "Preview first skybox",
+            type="secondary",
+            key="skybox_preview",
+        )
+        generate_skybox_batch = st.button(
+            "Generate skybox batch",
+            type="primary",
+            key="skybox_generate_batch",
+        )
+
+        if preview_skybox or generate_skybox_batch:
+            if not skybox_items:
+                st.error("No skybox prompts parsed. Please check your DOCX or pasted text.")
+                st.stop()
+            init_b64 = _b64_of_uploaded_file(init_img) if init_img else None
+            control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
+            items_to_run = skybox_items[:1] if preview_skybox else skybox_items
+            all_outputs: list[tuple[str, bytes]] = []
+            with st.status("Generating skyboxes…", expanded=True) as status:
+                try:
+                    for idx, item in enumerate(items_to_run):
+                        skybox_seed = build_seed(int(seed), idx)
+                        status.write(f"Generating {item['filename']}…")
+                        gen = blockade_generate_skybox(
+                            prompt=item["prompt"],
+                            style_id=style_id,
+                            negative_text=negative,
+                            seed=skybox_seed,
+                            enhance_prompt=enhance,
+                            init_image_b64=init_b64,
+                            init_strength=float(init_strength),
+                            control_image_b64=control_b64,
+                            control_model="remix",
+                            api_key=blockade_key,
+                        )
+                        skybox_oid = gen["obfuscated_id"]
+                        done = blockade_poll_generation(skybox_oid)
+                        skybox_png = download_url_bytes(done["file_url"])
+                        filename = f"{item['filename']}.png"
+                        all_outputs.append((filename, skybox_png))
+                        st.image(
+                            skybox_png,
+                            caption=f"{item['filename']} (equirectangular preview)",
+                            use_container_width=True,
+                        )
+
+                    if all_outputs:
+                        zip_bytes = zip_outputs(all_outputs, "skyboxes")
+                        st.download_button(
+                            "Download skybox ZIP",
+                            data=zip_bytes,
+                            file_name="skyboxes.zip",
+                            mime="application/zip",
+                        )
+                    status.update(label="Done", state="complete", expanded=False)
+                except requests.exceptions.RequestException as exc:
+                    status.update(label="Failed", state="error", expanded=True)
+                    st.error(f"Request failed while generating skyboxes: {exc}")
+                    st.exception(exc)
+                except RuntimeError as exc:
+                    status.update(label="Failed", state="error", expanded=True)
+                    st.error(f"Skybox generation failed: {exc}")
+                    st.exception(exc)
+                except TimeoutError as exc:
+                    status.update(label="Failed", state="error", expanded=True)
+                    st.error(f"Skybox generation timed out: {exc}")
+                    st.exception(exc)
+
         try:
             export_meta = blockade_get_export_types(api_key=blockade_key)
         except (requests.exceptions.RequestException, RuntimeError) as exc:
