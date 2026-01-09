@@ -33,6 +33,47 @@ def blockade_get_styles(model_version: int = 3, api_key: str = ""):
     resp.raise_for_status()
     return resp.json()
 
+@st.cache_data(ttl=3600)
+def blockade_get_export_types(api_key: str = ""):
+    url = f"{BLOCKADE_BASE}/skybox/export/types"
+    resp = requests.get(url, headers=blockade_headers(), timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+def _build_label_index(items: list[dict] | None) -> dict[str, int]:
+    label_index: dict[str, int] = {}
+    for item in items or []:
+        label = item.get("label") or item.get("name") or item.get("title")
+        if label is None:
+            continue
+        item_id = item.get("id")
+        if item_id is None:
+            continue
+        label_index[str(label)] = int(item_id)
+    return label_index
+
+def _extract_export_types(payload) -> list[dict]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("types", "export_types", "data", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+def _extract_export_resolutions(payload, export_types: list[dict]) -> list[dict]:
+    if isinstance(payload, dict):
+        for key in ("resolutions", "export_resolutions"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    for export_type in export_types or []:
+        resolutions = export_type.get("resolutions")
+        if isinstance(resolutions, list):
+            return resolutions
+    return []
+
 def blockade_generate_skybox(
     prompt: str,
     style_id: int,
@@ -147,14 +188,42 @@ with colB:
     control_img = st.file_uploader("Optional CONTROL image (2:1 equirectangular)", type=["png", "jpg", "jpeg"])
     st.caption("Control image preserves structure/perspective more than color. Requires control_model='remix'.")
 
-# Export choices: equirectangular PNG + Cube Map Default
-# Docs show export types list includes "equirectangular-png" and "cube-map-default-png". :contentReference[oaicite:16]{index=16}
-export_png_type_id = 2   # typically PNG in docs example list (verify via GET export types if you want dynamic)
-export_cubemap_type_id = 10
+export_meta = blockade_get_export_types(api_key=headers["x-api-key"])
+export_types = _extract_export_types(export_meta)
+export_type_ids = _build_label_index(export_types)
 
-res_choice = st.selectbox("Export resolution", ["2K", "4K", "8K", "16K"], index=2)
-res_map = {"1K": 1, "2K": 2, "4K": 3, "8K": 4, "16K": 7}  # based on docs example ids :contentReference[oaicite:17]{index=17}
-resolution_id = res_map[res_choice]
+expected_export_labels = {
+    "equirectangular-png": "equirectangular-png",
+    "cube-map-default-png": "cube-map-default-png",
+}
+missing_export_labels = [
+    label for label in expected_export_labels.values() if label not in export_type_ids
+]
+if missing_export_labels:
+    st.error(
+        "Export types response missing expected labels: "
+        f"{', '.join(missing_export_labels)}. Please refresh or check the API response."
+    )
+    st.stop()
+
+export_png_type_id = export_type_ids[expected_export_labels["equirectangular-png"]]
+export_cubemap_type_id = export_type_ids[expected_export_labels["cube-map-default-png"]]
+
+export_resolutions = _extract_export_resolutions(export_meta, export_types)
+export_resolution_ids = _build_label_index(export_resolutions)
+resolution_labels = ["2K", "4K", "8K", "16K"]
+missing_resolution_labels = [
+    label for label in resolution_labels if label not in export_resolution_ids
+]
+if missing_resolution_labels:
+    st.error(
+        "Export resolutions response missing expected labels: "
+        f"{', '.join(missing_resolution_labels)}. Please refresh or check the API response."
+    )
+    st.stop()
+
+res_choice = st.selectbox("Export resolution", resolution_labels, index=2)
+resolution_id = export_resolution_ids[res_choice]
 
 gen_btn = st.button("Generate Skybox", type="primary", use_container_width=True)
 
