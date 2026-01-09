@@ -32,14 +32,34 @@ def blockade_get_styles(model_version: int = 3, api_key: str = ""):
         params={"model_version": model_version},
         timeout=60,
     )
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        detail = resp.text
+        try:
+            detail = resp.json()
+        except ValueError:
+            pass
+        raise RuntimeError(
+            f"Blockade styles request failed ({resp.status_code}): {detail}"
+        ) from exc
     return resp.json()
 
 @st.cache_data(ttl=3600)
 def blockade_get_export_types(api_key: str = ""):
     url = f"{BLOCKADE_BASE}/skybox/export/types"
     resp = requests.get(url, headers=blockade_headers(), timeout=60)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        detail = resp.text
+        try:
+            detail = resp.json()
+        except ValueError:
+            pass
+        raise RuntimeError(
+            f"Blockade export types request failed ({resp.status_code}): {detail}"
+        ) from exc
     return resp.json()
 
 def _build_label_index(items: list[dict] | None) -> dict[str, int]:
@@ -232,7 +252,11 @@ def stability_generate_images(
 st.subheader("🌐 Skybox Generator (Blockade Labs)")
 
 headers = blockade_headers()
-styles = blockade_get_styles(model_version=3, api_key=headers["x-api-key"])
+try:
+    styles = blockade_get_styles(model_version=3, api_key=headers["x-api-key"])
+except (requests.exceptions.RequestException, RuntimeError) as exc:
+    st.error(f"Unable to load Blockade styles: {exc}")
+    st.stop()
 style_options = {f"{s['name']} (id {s['id']})": s["id"] for s in styles}
 style_label = st.selectbox("Skybox Style (Model 3)", list(style_options.keys()))
 style_id = style_options[style_label]
@@ -250,7 +274,11 @@ with colB:
     control_img = st.file_uploader("Optional CONTROL image (2:1 equirectangular)", type=["png", "jpg", "jpeg"])
     st.caption("Control image preserves structure/perspective more than color. Requires control_model='remix'.")
 
-export_meta = blockade_get_export_types(api_key=headers["x-api-key"])
+try:
+    export_meta = blockade_get_export_types(api_key=headers["x-api-key"])
+except (requests.exceptions.RequestException, RuntimeError) as exc:
+    st.error(f"Unable to load Blockade export types: {exc}")
+    st.stop()
 export_types = _extract_export_types(export_meta)
 export_type_ids = _build_label_index(export_types)
 
