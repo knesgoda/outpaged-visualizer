@@ -1,5 +1,6 @@
 import base64
 import io
+import os
 import re
 import time
 import zipfile
@@ -21,9 +22,12 @@ def _b64_of_uploaded_file(uploaded_file) -> str:
 
 def get_secret(key: str) -> str:
     try:
-        return st.secrets.get(key, "")
+        value = st.secrets.get(key, "")
     except FileNotFoundError:
-        return ""
+        value = ""
+    if value:
+        return value
+    return os.getenv(key, "")
 
 def blockade_api_key() -> str:
     return get_secret("BLOCKADE_API_KEY")
@@ -230,11 +234,11 @@ def stability_headers(api_key: str) -> dict:
     }
 
 def stability_api_key() -> str:
-    api_key = get_secret("STABILITY_API_KEY")
+    api_key = get_secret("STABILITY_API_KEY") or get_secret("STABILITY_KEY")
     if not api_key:
         st.error(
-            "Missing STABILITY_API_KEY in Streamlit Secrets. The key needs access to "
-            "Stability.ai Stable Image Core (v2beta) generation."
+            "Missing STABILITY_API_KEY (or STABILITY_KEY) in Streamlit Secrets. The key "
+            "needs access to Stability.ai Stable Image Core (v2beta) generation."
         )
         st.stop()
     return api_key
