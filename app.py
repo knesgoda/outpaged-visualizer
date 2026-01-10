@@ -9,11 +9,10 @@ import zipfile
 import requests
 import streamlit as st
 from docx import Document
-from PIL import Image, ImageStat
+from PIL import Image
 
 BLOCKADE_BASE = "https://backend.blockadelabs.com/api/v1"
 STABILITY_CORE_URL = "https://api.stability.ai/v2beta/stable-image/generate/core"
-OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
 STABILITY_MAX_UPLOAD_BYTES = 9 * 1024 * 1024
 
 st.set_page_config(page_title="OutPaged Visualizer", layout="wide")
@@ -328,48 +327,6 @@ def stability_generate_images(
         ]
     raise RuntimeError("Stability.ai response did not include images.")
 
-def openai_api_key() -> str:
-    return get_secret("OPENAI_API_KEY")
-
-def openai_headers(api_key: str) -> dict:
-    return {
-        "authorization": f"Bearer {api_key}",
-        "content-type": "application/json",
-    }
-
-def openai_image_size(aspect_ratio: str) -> str:
-    size_map = {
-        "1:1": "1024x1024",
-        "2:3": "1024x1536",
-        "3:2": "1536x1024",
-        "9:16": "1024x1536",
-        "16:9": "1536x1024",
-        "2:1": "1536x1024",
-    }
-    return size_map.get(aspect_ratio, "1024x1024")
-
-def _pad_image_to_ratio(image_bytes: bytes, ratio_w: int, ratio_h: int) -> bytes:
-    with Image.open(io.BytesIO(image_bytes)) as image:
-        width, height = image.size
-        target_ratio = ratio_w / ratio_h
-        current_ratio = width / height if height else 1
-        if abs(current_ratio - target_ratio) < 0.01:
-            return image_bytes
-        if current_ratio < target_ratio:
-            target_width = int(round(height * target_ratio))
-            target_height = height
-        else:
-            target_width = width
-            target_height = int(round(width / target_ratio))
-        stat = ImageStat.Stat(image)
-        mean = tuple(int(value) for value in stat.mean)
-        background = Image.new(image.mode, (target_width, target_height), mean)
-        offset = ((target_width - width) // 2, (target_height - height) // 2)
-        background.paste(image, offset)
-        buffer = io.BytesIO()
-        background.save(buffer, format="PNG")
-        return buffer.getvalue()
-
 def _encode_image_for_upload(image: Image.Image, use_png: bool) -> tuple[bytes, str, str]:
     buffer = io.BytesIO()
     if use_png:
@@ -415,44 +372,6 @@ def _prepare_stability_init_image(
         encoded, filename, mime_type = _encode_image_for_upload(resized, use_png)
 
     return encoded, filename, mime_type, True
-
-def openai_generate_images(
-    prompt: str,
-    image_count: int,
-    aspect_ratio: str,
-    api_key: str,
-):
-    if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY for OpenAI image generation.")
-    payload = {
-        "model": "gpt-image-1",
-        "prompt": prompt,
-        "n": image_count,
-        "size": openai_image_size(aspect_ratio),
-    }
-    resp = requests.post(
-        OPENAI_IMAGE_URL,
-        headers=openai_headers(api_key),
-        json=payload,
-        timeout=180,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"OpenAI image error {resp.status_code}: {resp.text}")
-    data = resp.json()
-    images = []
-    for item in data.get("data", []):
-        b64_payload = item.get("b64_json")
-        if b64_payload:
-            images.append(base64.b64decode(b64_payload))
-            continue
-        image_url = item.get("url")
-        if image_url:
-            images.append(download_url_bytes(image_url))
-    if aspect_ratio == "2:1":
-        images = [_pad_image_to_ratio(image, 2, 1) for image in images]
-    if not images:
-        raise RuntimeError("OpenAI response did not include images.")
-    return images
 
 def read_docx_text(uploaded_file) -> str:
     document = Document(uploaded_file)
@@ -694,7 +613,6 @@ with tabs[0]:
         if not bg_items:
             st.error("No background prompts parsed. Please check your DOCX or pasted text.")
             st.stop()
-        openai_key = openai_api_key()
         location_cache = st.session_state["location_cache"]
         items_to_run = bg_items[:1] if preview_bg else bg_items
         all_outputs: list[tuple[str, bytes]] = []
@@ -719,7 +637,7 @@ with tabs[0]:
                             f"({similarity:.2f} match to '{cached_entry.get('location_label', 'unknown')}')."
                         )
                     status.write(f"Generating {item['filename']}…")
-                    provider_label = "OpenAI"
+                    provider_label = "Stability.ai"
                     init_bytes_to_use = init_bytes
                     if cached_init_bytes and init_bytes_to_use is None:
                         init_bytes_to_use = cached_init_bytes
@@ -728,31 +646,17 @@ with tabs[0]:
                     if seed_to_use is None and cached_seed is not None:
                         seed_to_use = cached_seed
                         status.write(f"Reusing cached seed {seed_to_use} for this background.")
-                    try:
-                        images = openai_generate_images(
-                            prompt=item["prompt"],
-                            image_count=bg_count,
-                            aspect_ratio=bg_aspect,
-                            api_key=openai_key,
-                        )
-                    except (requests.exceptions.RequestException, RuntimeError, TimeoutError) as exc:
-                        provider_label = "Stability.ai"
-                        status.write(
-                            f"OpenAI image generation failed for {item['filename']}; "
-                            "falling back to Stability.ai."
-                        )
-                        st.warning(f"OpenAI generation failed for {item['filename']}: {exc}")
-                        stability_key = stability_api_key()
-                        images = stability_generate_images(
-                            prompt=item["prompt"],
-                            negative_prompt=negative_prompt,
-                            seed=seed_to_use,
-                            aspect_ratio=bg_aspect,
-                            image_count=bg_count,
-                            api_key=stability_key,
-                            init_image_bytes=init_bytes_to_use,
-                            init_strength=bg_strength if init_bytes_to_use else None,
-                        )
+                    stability_key = stability_api_key()
+                    images = stability_generate_images(
+                        prompt=item["prompt"],
+                        negative_prompt=negative_prompt,
+                        seed=seed_to_use,
+                        aspect_ratio=bg_aspect,
+                        image_count=bg_count,
+                        api_key=stability_key,
+                        init_image_bytes=init_bytes_to_use,
+                        init_strength=bg_strength if init_bytes_to_use else None,
+                    )
                     status.write(f"Provider used: {provider_label}")
                     seed_used = seed_to_use if provider_label == "Stability.ai" else None
                     if images:
@@ -922,7 +826,6 @@ with tabs[1]:
         if not char_items:
             st.error("No character prompts parsed. Please check your DOCX or pasted text.")
             st.stop()
-        openai_key = openai_api_key()
         location_cache = st.session_state["location_cache"]
         init_bytes = char_ref_image.getvalue() if char_ref_image else None
         variants = [
@@ -960,41 +863,24 @@ with tabs[1]:
                         view_prompt = f"{item['prompt']}, {variant_suffix}"
                         negative_prompt = item.get("negative_prompt") or char_negative.strip()
                         status.write(f"Generating {item['filename']} {variant_key}…")
-                        provider_label = "OpenAI"
+                        provider_label = "Stability.ai"
                         seed_to_use = seed
                         if seed_to_use is None and cached_seed is not None:
                             seed_to_use = cached_seed
                             status.write(
                                 f"Reusing cached seed {seed_to_use} for {item['filename']} {variant_key}."
                             )
-                        try:
-                            images = openai_generate_images(
-                                prompt=view_prompt,
-                                image_count=char_count,
-                                aspect_ratio=char_aspect,
-                                api_key=openai_key,
-                            )
-                        except (requests.exceptions.RequestException, RuntimeError, TimeoutError) as exc:
-                            provider_label = "Stability.ai"
-                            status.write(
-                                f"OpenAI image generation failed for {item['filename']} "
-                                f"{variant_key}; falling back to Stability.ai."
-                            )
-                            st.warning(
-                                f"OpenAI generation failed for {item['filename']} "
-                                f"{variant_key}: {exc}"
-                            )
-                            stability_key = stability_api_key()
-                            images = stability_generate_images(
-                                prompt=view_prompt,
-                                negative_prompt=negative_prompt,
-                                seed=seed_to_use,
-                                aspect_ratio=char_aspect,
-                                image_count=char_count,
-                                api_key=stability_key,
-                                init_image_bytes=init_bytes_to_use,
-                                init_strength=char_strength if init_bytes_to_use else None,
-                            )
+                        stability_key = stability_api_key()
+                        images = stability_generate_images(
+                            prompt=view_prompt,
+                            negative_prompt=negative_prompt,
+                            seed=seed_to_use,
+                            aspect_ratio=char_aspect,
+                            image_count=char_count,
+                            api_key=stability_key,
+                            init_image_bytes=init_bytes_to_use,
+                            init_strength=char_strength if init_bytes_to_use else None,
+                        )
                         status.write(f"Provider used: {provider_label}")
                         seed_used = seed_to_use if provider_label == "Stability.ai" else None
                         if variant_index == 0 and images:
