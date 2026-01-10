@@ -14,6 +14,7 @@ from PIL import Image, ImageStat
 BLOCKADE_BASE = "https://backend.blockadelabs.com/api/v1"
 STABILITY_CORE_URL = "https://api.stability.ai/v2beta/stable-image/generate/core"
 OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
+STABILITY_MAX_UPLOAD_BYTES = 9 * 1024 * 1024
 
 st.set_page_config(page_title="OutPaged Visualizer", layout="wide")
 st.title("OutPaged Visualizer")
@@ -288,7 +289,14 @@ def stability_generate_images(
 
     files = {key: (None, str(value)) for key, value in payload.items()}
     if init_image_bytes is not None:
-        files["image"] = ("init.png", init_image_bytes, "image/png")
+        init_image_bytes, init_filename, init_mime, resized = _prepare_stability_init_image(
+            init_image_bytes
+        )
+        if resized:
+            st.info(
+                "Reference image was resized/compressed to stay within Stability.ai upload limits."
+            )
+        files["image"] = (init_filename, init_image_bytes, init_mime)
 
     resp = requests.post(
         STABILITY_CORE_URL,
@@ -361,6 +369,52 @@ def _pad_image_to_ratio(image_bytes: bytes, ratio_w: int, ratio_h: int) -> bytes
         buffer = io.BytesIO()
         background.save(buffer, format="PNG")
         return buffer.getvalue()
+
+def _encode_image_for_upload(image: Image.Image, use_png: bool) -> tuple[bytes, str, str]:
+    buffer = io.BytesIO()
+    if use_png:
+        image.save(buffer, format="PNG", optimize=True, compress_level=9)
+        return buffer.getvalue(), "init.png", "image/png"
+    image.save(
+        buffer,
+        format="JPEG",
+        quality=85,
+        optimize=True,
+        progressive=True,
+    )
+    return buffer.getvalue(), "init.jpg", "image/jpeg"
+
+def _prepare_stability_init_image(
+    init_image_bytes: bytes,
+    max_bytes: int = STABILITY_MAX_UPLOAD_BYTES,
+    min_dimension: int = 256,
+) -> tuple[bytes, str, str, bool]:
+    if len(init_image_bytes) <= max_bytes:
+        return init_image_bytes, "init.png", "image/png", False
+
+    try:
+        with Image.open(io.BytesIO(init_image_bytes)) as image:
+            image_copy = image.copy()
+    except OSError:
+        return init_image_bytes, "init.png", "image/png", False
+
+    has_alpha = image_copy.mode in ("RGBA", "LA") or (
+        image_copy.mode == "P" and "transparency" in image_copy.info
+    )
+    use_png = bool(has_alpha)
+    encoded, filename, mime_type = _encode_image_for_upload(image_copy, use_png)
+
+    width, height = image_copy.size
+    resized = image_copy
+    while len(encoded) > max_bytes and min(width, height) > min_dimension:
+        scale = (max_bytes / len(encoded)) ** 0.5
+        scale = max(0.5, min(0.9, scale))
+        width = max(min_dimension, int(width * scale))
+        height = max(min_dimension, int(height * scale))
+        resized = resized.resize((width, height), Image.LANCZOS)
+        encoded, filename, mime_type = _encode_image_for_upload(resized, use_png)
+
+    return encoded, filename, mime_type, True
 
 def openai_generate_images(
     prompt: str,
