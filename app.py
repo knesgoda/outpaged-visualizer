@@ -1,4 +1,5 @@
 import base64
+import difflib
 import io
 import os
 import re
@@ -16,6 +17,9 @@ OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
 st.set_page_config(page_title="OutPaged Visualizer", layout="wide")
 st.title("OutPaged Visualizer")
 st.caption("Bulk-generate backgrounds, character training sets, and skyboxes from your DOCX prompts.")
+
+if "location_cache" not in st.session_state:
+    st.session_state["location_cache"] = {}
 
 def _b64_of_uploaded_file(uploaded_file) -> str:
     data = uploaded_file.getvalue()
@@ -383,6 +387,66 @@ def _sanitize_prompt_text(text: str) -> str:
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned.strip(" ,;-")
 
+def normalize_location(text: str) -> str:
+    cleaned = re.sub(r"[^\w\s]", " ", text.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+def _extract_location_line(lines: list[str]) -> tuple[str | None, list[str]]:
+    location = None
+    remaining_lines: list[str] = []
+    for line in lines:
+        match = re.match(r"location\s*:\s*(.+)", line, flags=re.IGNORECASE)
+        if match and location is None:
+            location = match.group(1).strip()
+            continue
+        remaining_lines.append(line)
+    return location, remaining_lines
+
+def _fallback_location(prompt_text: str, max_len: int = 120) -> str:
+    trimmed = prompt_text.strip()
+    if not trimmed:
+        return "unknown location"
+    return trimmed[:max_len].strip()
+
+def _resolve_location(location: str | None, prompt_text: str) -> str:
+    return location or _fallback_location(prompt_text)
+
+def find_similar_location(
+    location_key: str,
+    cache: dict[str, dict],
+    threshold: float = 0.82,
+) -> tuple[str | None, dict | None, float]:
+    best_key = None
+    best_entry = None
+    best_score = 0.0
+    for cached_key, entry in cache.items():
+        score = difflib.SequenceMatcher(None, location_key, cached_key).ratio()
+        if score > best_score:
+            best_score = score
+            best_key = cached_key
+            best_entry = entry
+    if best_key and best_score >= threshold:
+        return best_key, best_entry, best_score
+    return None, None, best_score
+
+def update_location_cache(
+    cache: dict[str, dict],
+    location_key: str,
+    location_label: str,
+    image_bytes: bytes | None,
+    seed: int | None,
+    prompt: str,
+) -> None:
+    if not location_key:
+        return
+    cache[location_key] = {
+        "location_label": location_label,
+        "image_bytes": image_bytes,
+        "seed": seed,
+        "prompt": prompt,
+    }
+
 def _split_prompt_and_negative(text: str) -> tuple[str, str]:
     match = re.search(r"\bnegative prompt\b\s*:?", text, flags=re.IGNORECASE)
     if not match:
@@ -408,13 +472,16 @@ def parse_prompt_blocks(text: str, label_patterns: list[str]) -> list[dict]:
                 break
         if match:
             if current_name:
-                raw_text = " ".join(l for l in current_lines if l.strip()).strip()
+                location_line, remaining_lines = _extract_location_line(current_lines)
+                raw_text = " ".join(l for l in remaining_lines if l.strip()).strip()
                 prompt_text, negative_text = _split_prompt_and_negative(raw_text)
+                location_text = _resolve_location(location_line, prompt_text)
                 items.append(
                     {
                         "filename": current_name,
                         "prompt": prompt_text,
                         "negative_prompt": negative_text,
+                        "location": location_text,
                     }
                 )
             current_name = match.group("filename").strip()
@@ -422,13 +489,16 @@ def parse_prompt_blocks(text: str, label_patterns: list[str]) -> list[dict]:
         elif current_name:
             current_lines.append(line)
     if current_name:
-        raw_text = " ".join(l for l in current_lines if l.strip()).strip()
+        location_line, remaining_lines = _extract_location_line(current_lines)
+        raw_text = " ".join(l for l in remaining_lines if l.strip()).strip()
         prompt_text, negative_text = _split_prompt_and_negative(raw_text)
+        location_text = _resolve_location(location_line, prompt_text)
         items.append(
             {
                 "filename": current_name,
                 "prompt": prompt_text,
                 "negative_prompt": negative_text,
+                "location": location_text,
             }
         )
     return [item for item in items if item["filename"] and item["prompt"]]
@@ -542,6 +612,7 @@ with tabs[0]:
             st.error("No background prompts parsed. Please check your DOCX or pasted text.")
             st.stop()
         openai_key = openai_api_key()
+        location_cache = st.session_state["location_cache"]
         items_to_run = bg_items[:1] if preview_bg else bg_items
         all_outputs: list[tuple[str, bytes]] = []
         init_bytes = bg_ref_image.getvalue() if bg_ref_image else None
@@ -550,8 +621,30 @@ with tabs[0]:
                 for idx, item in enumerate(items_to_run):
                     seed = build_seed(bg_seed, idx)
                     negative_prompt = item.get("negative_prompt") or bg_negative.strip()
+                    location_key = normalize_location(item.get("location", ""))
+                    cached_key, cached_entry, similarity = find_similar_location(
+                        location_key,
+                        location_cache,
+                    )
+                    cached_init_bytes = None
+                    cached_seed = None
+                    if cached_entry:
+                        cached_init_bytes = cached_entry.get("image_bytes")
+                        cached_seed = cached_entry.get("seed")
+                        status.write(
+                            "Similar location detected "
+                            f"({similarity:.2f} match to '{cached_entry.get('location_label', 'unknown')}')."
+                        )
                     status.write(f"Generating {item['filename']}…")
                     provider_label = "OpenAI"
+                    init_bytes_to_use = init_bytes
+                    if cached_init_bytes and init_bytes_to_use is None:
+                        init_bytes_to_use = cached_init_bytes
+                        status.write("Reusing cached reference image for this background.")
+                    seed_to_use = seed
+                    if seed_to_use is None and cached_seed is not None:
+                        seed_to_use = cached_seed
+                        status.write(f"Reusing cached seed {seed_to_use} for this background.")
                     try:
                         images = openai_generate_images(
                             prompt=item["prompt"],
@@ -570,14 +663,24 @@ with tabs[0]:
                         images = stability_generate_images(
                             prompt=item["prompt"],
                             negative_prompt=negative_prompt,
-                            seed=seed,
+                            seed=seed_to_use,
                             aspect_ratio=bg_aspect,
                             image_count=bg_count,
                             api_key=stability_key,
-                            init_image_bytes=init_bytes,
-                            init_strength=bg_strength if init_bytes else None,
+                            init_image_bytes=init_bytes_to_use,
+                            init_strength=bg_strength if init_bytes_to_use else None,
                         )
                     status.write(f"Provider used: {provider_label}")
+                    seed_used = seed_to_use if provider_label == "Stability.ai" else None
+                    if images:
+                        update_location_cache(
+                            location_cache,
+                            location_key,
+                            item.get("location", ""),
+                            images[0],
+                            seed_used,
+                            item["prompt"],
+                        )
                     for image_index, image_bytes in enumerate(images, start=1):
                         if bg_count > 1:
                             filename = f"{item['filename']}_{image_index:02d}.png"
@@ -737,6 +840,7 @@ with tabs[1]:
             st.error("No character prompts parsed. Please check your DOCX or pasted text.")
             st.stop()
         openai_key = openai_api_key()
+        location_cache = st.session_state["location_cache"]
         init_bytes = char_ref_image.getvalue() if char_ref_image else None
         variants = [
             ("full_body", full_body_suffix),
@@ -749,6 +853,24 @@ with tabs[1]:
         with st.status("Generating character images…", expanded=True) as status:
             try:
                 for item_index, item in enumerate(items_to_run):
+                    location_key = normalize_location(item.get("location", ""))
+                    cached_key, cached_entry, similarity = find_similar_location(
+                        location_key,
+                        location_cache,
+                    )
+                    cached_init_bytes = None
+                    cached_seed = None
+                    if cached_entry:
+                        cached_init_bytes = cached_entry.get("image_bytes")
+                        cached_seed = cached_entry.get("seed")
+                        status.write(
+                            "Similar location detected "
+                            f"({similarity:.2f} match to '{cached_entry.get('location_label', 'unknown')}')."
+                        )
+                    init_bytes_to_use = init_bytes
+                    if cached_init_bytes and init_bytes_to_use is None:
+                        init_bytes_to_use = cached_init_bytes
+                        status.write("Reusing cached reference image for this character.")
                     for variant_index, (variant_key, variant_suffix) in enumerate(variants):
                         seed_offset = item_index * 100 + variant_index * 10
                         seed = build_seed(char_seed, seed_offset)
@@ -756,6 +878,12 @@ with tabs[1]:
                         negative_prompt = item.get("negative_prompt") or char_negative.strip()
                         status.write(f"Generating {item['filename']} {variant_key}…")
                         provider_label = "OpenAI"
+                        seed_to_use = seed
+                        if seed_to_use is None and cached_seed is not None:
+                            seed_to_use = cached_seed
+                            status.write(
+                                f"Reusing cached seed {seed_to_use} for {item['filename']} {variant_key}."
+                            )
                         try:
                             images = openai_generate_images(
                                 prompt=view_prompt,
@@ -777,14 +905,24 @@ with tabs[1]:
                             images = stability_generate_images(
                                 prompt=view_prompt,
                                 negative_prompt=negative_prompt,
-                                seed=seed,
+                                seed=seed_to_use,
                                 aspect_ratio=char_aspect,
                                 image_count=char_count,
                                 api_key=stability_key,
-                                init_image_bytes=init_bytes,
-                                init_strength=char_strength if init_bytes else None,
+                                init_image_bytes=init_bytes_to_use,
+                                init_strength=char_strength if init_bytes_to_use else None,
                             )
                         status.write(f"Provider used: {provider_label}")
+                        seed_used = seed_to_use if provider_label == "Stability.ai" else None
+                        if variant_index == 0 and images:
+                            update_location_cache(
+                                location_cache,
+                                location_key,
+                                item.get("location", ""),
+                                images[0],
+                                seed_used,
+                                item["prompt"],
+                            )
                         for image_index, image_bytes in enumerate(images, start=1):
                             if char_count > 1:
                                 filename = f"{item['filename']}_{variant_key}_{image_index:02d}.png"
@@ -936,6 +1074,7 @@ with tabs[2]:
                 st.stop()
             init_b64 = _b64_of_uploaded_file(init_img) if init_img else None
             control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
+            location_cache = st.session_state["location_cache"]
             items_to_run = skybox_items[:1] if preview_skybox else skybox_items
             all_outputs: list[tuple[str, bytes]] = []
             with st.status("Generating skyboxes…", expanded=True) as status:
@@ -943,14 +1082,36 @@ with tabs[2]:
                     for idx, item in enumerate(items_to_run):
                         skybox_seed = build_seed(int(seed), idx)
                         negative_text = item.get("negative_prompt") or negative
+                        location_key = normalize_location(item.get("location", ""))
+                        cached_key, cached_entry, similarity = find_similar_location(
+                            location_key,
+                            location_cache,
+                        )
+                        cached_init_bytes = None
+                        cached_seed = None
+                        if cached_entry:
+                            cached_init_bytes = cached_entry.get("image_bytes")
+                            cached_seed = cached_entry.get("seed")
+                            status.write(
+                                "Similar location detected "
+                                f"({similarity:.2f} match to '{cached_entry.get('location_label', 'unknown')}')."
+                            )
                         status.write(f"Generating {item['filename']}…")
+                        init_b64_to_use = init_b64
+                        if cached_init_bytes and init_b64_to_use is None:
+                            init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
+                            status.write("Reusing cached INIT image for this skybox.")
+                        seed_to_use = skybox_seed
+                        if seed_to_use is None and cached_seed is not None:
+                            seed_to_use = cached_seed
+                            status.write(f"Reusing cached seed {seed_to_use} for this skybox.")
                         gen = blockade_generate_skybox(
                             prompt=item["prompt"],
                             style_id=style_id,
                             negative_text=negative_text,
-                            seed=skybox_seed,
+                            seed=seed_to_use,
                             enhance_prompt=enhance,
-                            init_image_b64=init_b64,
+                            init_image_b64=init_b64_to_use,
                             init_strength=float(init_strength),
                             control_image_b64=control_b64,
                             control_model="remix",
@@ -959,6 +1120,14 @@ with tabs[2]:
                         skybox_oid = gen["obfuscated_id"]
                         done = blockade_poll_generation(skybox_oid)
                         skybox_png = download_url_bytes(done["file_url"])
+                        update_location_cache(
+                            location_cache,
+                            location_key,
+                            item.get("location", ""),
+                            skybox_png,
+                            seed_to_use,
+                            item["prompt"],
+                        )
                         filename = f"{item['filename']}.png"
                         all_outputs.append((filename, skybox_png))
                         st.image(
@@ -1085,18 +1254,45 @@ with tabs[2]:
             init_b64 = _b64_of_uploaded_file(init_img) if init_img else None
             control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
             skybox_seed = None if seed == 0 else int(seed)
-            prompt_text, prompt_negative = _split_prompt_and_negative(prompt)
+            prompt_lines = [line.strip() for line in prompt.splitlines() if line.strip()]
+            location_line, remaining_lines = _extract_location_line(prompt_lines)
+            prompt_text, prompt_negative = _split_prompt_and_negative(" ".join(remaining_lines).strip())
             negative_text = prompt_negative or negative
+            location_text = _resolve_location(location_line, prompt_text)
+            location_key = normalize_location(location_text)
+            location_cache = st.session_state["location_cache"]
+            cached_key, cached_entry, similarity = find_similar_location(
+                location_key,
+                location_cache,
+            )
+            cached_init_bytes = None
+            cached_seed = None
+            if cached_entry:
+                cached_init_bytes = cached_entry.get("image_bytes")
+                cached_seed = cached_entry.get("seed")
 
             with st.status("Generating skybox…", expanded=True) as status:
                 try:
+                    if cached_entry:
+                        status.write(
+                            "Similar location detected "
+                            f"({similarity:.2f} match to '{cached_entry.get('location_label', 'unknown')}')."
+                        )
+                    init_b64_to_use = init_b64
+                    if cached_init_bytes and init_b64_to_use is None:
+                        init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
+                        status.write("Reusing cached INIT image for this skybox.")
+                    seed_to_use = skybox_seed
+                    if seed_to_use is None and cached_seed is not None:
+                        seed_to_use = cached_seed
+                        status.write(f"Reusing cached seed {seed_to_use} for this skybox.")
                     gen = blockade_generate_skybox(
                         prompt=prompt_text,
                         style_id=style_id,
                         negative_text=negative_text,
-                        seed=skybox_seed,
+                        seed=seed_to_use,
                         enhance_prompt=enhance,
-                        init_image_b64=init_b64,
+                        init_image_b64=init_b64_to_use,
                         init_strength=float(init_strength),
                         control_image_b64=control_b64,
                         control_model="remix",
@@ -1108,8 +1304,16 @@ with tabs[2]:
                     done = blockade_poll_generation(skybox_oid)
                     status.write("Skybox complete. Fetching base image…")
                     skybox_png = download_url_bytes(done["file_url"])
-    
+
                     st.image(skybox_png, caption="Skybox (equirectangular preview)", use_container_width=True)
+                    update_location_cache(
+                        location_cache,
+                        location_key,
+                        location_text,
+                        skybox_png,
+                        seed_to_use,
+                        prompt_text,
+                    )
                     st.download_button(
                         "Download equirectangular (base)",
                         data=skybox_png,
