@@ -568,11 +568,12 @@ with tabs[0]:
         "text, watermark, logo, low quality, blurry",
         key="background_negative",
     )
-    bg_aspect = st.selectbox(
-        "Aspect ratio",
-        ["1:1", "2:3", "3:2", "9:16", "16:9", "2:1"],
-        index=4,
-        key="background_aspect",
+    bg_aspect = "2:1"
+    st.text_input(
+        "Aspect ratio (locked)",
+        value=bg_aspect,
+        disabled=True,
+        key="background_aspect_display",
     )
     bg_seed = st.number_input(
         "Seed (0 = random)",
@@ -647,8 +648,9 @@ with tabs[0]:
                         seed_to_use = cached_seed
                         status.write(f"Reusing cached seed {seed_to_use} for this background.")
                     stability_key = stability_api_key()
+                    prompt_text = _sanitize_prompt_text(item["prompt"])
                     images = stability_generate_images(
-                        prompt=item["prompt"],
+                        prompt=prompt_text,
                         negative_prompt=negative_prompt,
                         seed=seed_to_use,
                         aspect_ratio=bg_aspect,
@@ -666,7 +668,7 @@ with tabs[0]:
                             item.get("location", ""),
                             images[0],
                             seed_used,
-                            item["prompt"],
+                            prompt_text,
                         )
                     for image_index, image_bytes in enumerate(images, start=1):
                         if bg_count > 1:
