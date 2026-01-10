@@ -6,6 +6,7 @@ import re
 import time
 import zipfile
 
+import numpy as np
 import requests
 import streamlit as st
 from docx import Document
@@ -30,6 +31,16 @@ FRAMING_MODE_OPTIONS = {
     "Crop to 2:1 (no bars)": "crop",
     "Pad to 2:1 (no stretch)": "pad",
 }
+
+ANTI_LETTERBOX_TOKENS = [
+    "letterbox",
+    "letterboxing",
+    "black bars",
+    "cinematic bars",
+    "frame",
+    "border",
+    "vignette",
+]
 
 with st.sidebar:
     st.header("Output options")
@@ -401,6 +412,7 @@ def make_skybox_init_from_stability(
     base_seed: int | None,
     api_key: str,
     candidates: int = 3,
+    padding_style: str = "blur",
 ) -> tuple[bytes, int | None]:
     wrapper_prefix = (
         "wide environment plate, horizon centered, no close foreground, evenly distributed detail, "
@@ -426,7 +438,13 @@ def make_skybox_init_from_stability(
             aspect_ratio=source_aspect,
             api_key=api_key,
         )
-        fixed = prepare_skybox_ready_bytes(raw, target_size=(2048, 1024), make_tileable=True)
+        cleaned = postprocess_image_bytes(
+            raw,
+            intended_ratio_tuple=(2, 1),
+            padding_style=padding_style,
+            remove_bars=True,
+        )
+        fixed = prepare_skybox_ready_bytes(cleaned, target_size=(2048, 1024), make_tileable=True)
         score = edge_seam_score(fixed)
 
         if best_score is None or score < best_score:
@@ -509,8 +527,6 @@ def _make_tileable_horizontal(img: Image.Image, blend_px: int = 64) -> Image.Ima
     Makes left/right edges more compatible by doing a wrap shift and blending the seam.
     This is a lightweight way to reduce visible seams when Skybox wraps the pano.
     """
-    import numpy as np
-
     img = img.convert("RGB")
     width, height = img.size
 
@@ -569,8 +585,6 @@ def edge_seam_score(image_bytes: bytes) -> float:
     Lower is better. Measures how similar the left and right edges are.
     Cheap heuristic to pick the best candidate before spending Skybox credits.
     """
-    import numpy as np
-
     with Image.open(io.BytesIO(image_bytes)) as image:
         image = image.convert("RGB")
         arr = np.array(image).astype("float32")
@@ -608,43 +622,64 @@ def _build_mirrored_background(
             background.paste(tile, (x, y))
     return background
 
-def strip_letterbox(
-    image: Image.Image,
-    threshold: int = 8,
-    min_bar_px: int = 24,
-) -> Image.Image:
-    rgb = image.convert("RGB")
-    width, height = rgb.size
+def remove_letterbox_bars(
+    image_bytes: bytes,
+    min_bar_px: int = 10,
+    max_bar_ratio: float = 0.25,
+) -> tuple[bytes, int, int, bool]:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            rgb = image.convert("RGB")
+    except OSError:
+        return image_bytes, 0, 0, False
+
+    arr = np.array(rgb).astype("float32")
+    height, width, _ = arr.shape
     if height < min_bar_px * 2:
-        return image
+        return image_bytes, 0, 0, False
 
-    pixels = rgb.load()
+    lum = 0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1] + 0.0722 * arr[:, :, 2]
+    row_mean = lum.mean(axis=1)
+    row_var = lum.var(axis=1)
 
-    def row_is_dark(row_y: int) -> bool:
-        total = 0
-        for x in range(width):
-            r, g, b = pixels[x, row_y]
-            total += r + g + b
-        mean = total / (width * 3)
-        return mean <= threshold
+    interior_start = int(height * 0.25)
+    interior_end = int(height * 0.75)
+    interior_mean = float(np.median(row_mean[interior_start:interior_end]))
+    interior_var = float(np.median(row_var[interior_start:interior_end])) + 1e-6
 
-    top = 0
-    while top < height and row_is_dark(top):
-        top += 1
-    bottom = height - 1
-    while bottom >= 0 and row_is_dark(bottom):
-        bottom -= 1
+    max_bar_px = int(height * max_bar_ratio)
 
-    crop_top = top if top >= min_bar_px else 0
-    crop_bottom = (height - 1 - bottom) if (height - 1 - bottom) >= min_bar_px else 0
+    def _scan_bar(row_indices: range) -> int:
+        bar_height = 0
+        for idx in row_indices:
+            dark_enough = row_mean[idx] < max(10.0, interior_mean * 0.6)
+            low_variance = row_var[idx] < interior_var * 0.15
+            if dark_enough and low_variance:
+                bar_height += 1
+                if bar_height > max_bar_px:
+                    break
+            else:
+                break
+        return bar_height
 
-    if crop_top == 0 and crop_bottom == 0:
-        return image
+    top_bar = _scan_bar(range(0, height))
+    bottom_bar = _scan_bar(range(height - 1, -1, -1))
 
-    new_bottom = height - crop_bottom
-    if crop_top >= new_bottom:
-        return image
-    return image.crop((0, crop_top, width, new_bottom))
+    if not (min_bar_px <= top_bar <= max_bar_px):
+        top_bar = 0
+    if not (min_bar_px <= bottom_bar <= max_bar_px):
+        bottom_bar = 0
+
+    if top_bar == 0 and bottom_bar == 0:
+        return image_bytes, 0, 0, False
+
+    crop_top = top_bar
+    crop_bottom = height - bottom_bar
+    if crop_top >= crop_bottom:
+        return image_bytes, 0, 0, False
+
+    cropped = rgb.crop((0, crop_top, width, crop_bottom))
+    return _image_to_png_bytes(cropped), top_bar, bottom_bar, True
 
 def crop_to_ratio(image: Image.Image, target_ratio: float) -> Image.Image:
     return _center_crop_to_ratio(image, target_ratio)
@@ -698,7 +733,9 @@ def postprocess_to_2to1(
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
             image = image.convert("RGBA")
-            image = strip_letterbox(image)
+            cleaned_bytes, _, _, _ = remove_letterbox_bars(_image_to_png_bytes(image))
+            with Image.open(io.BytesIO(cleaned_bytes)) as cleaned:
+                image = cleaned.convert("RGBA")
             if mode == "crop":
                 processed = crop_to_ratio(image, 2.0)
             else:
@@ -715,6 +752,50 @@ def _apply_panoramic_conversion(
 ) -> bytes:
     return postprocess_to_2to1(image_bytes, enabled, mode, padding_style)
 
+def convert_to_panoramic(
+    image_bytes: bytes,
+    target_ratio: tuple[int, int],
+    padding_style: str,
+) -> bytes:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image = image.convert("RGBA")
+            ratio = target_ratio[0] / target_ratio[1]
+            width, height = image.size
+            if height == 0 or width == 0:
+                return image_bytes
+            current_ratio = width / height
+            if abs(current_ratio - ratio) < 1e-6:
+                return image_bytes
+            padded = pad_to_ratio(image, ratio, padding_style)
+            return _image_to_png_bytes(padded)
+    except OSError:
+        return image_bytes
+
+def postprocess_image_bytes(
+    image_bytes: bytes,
+    intended_ratio_tuple: tuple[int, int],
+    padding_style: str,
+    remove_bars: bool = True,
+) -> bytes:
+    processed_bytes = image_bytes
+    if remove_bars:
+        processed_bytes, top_px, bottom_px, did_remove = remove_letterbox_bars(processed_bytes)
+        if did_remove:
+            st.write(f"Removed letterbox bars: top={top_px}px bottom={bottom_px}px")
+    ratio = intended_ratio_tuple[0] / intended_ratio_tuple[1]
+    try:
+        with Image.open(io.BytesIO(processed_bytes)) as image:
+            width, height = image.size
+    except OSError:
+        return processed_bytes
+    if height == 0 or width == 0:
+        return processed_bytes
+    current_ratio = width / height
+    if abs(current_ratio - ratio) > 1e-6:
+        processed_bytes = convert_to_panoramic(processed_bytes, intended_ratio_tuple, padding_style)
+    return processed_bytes
+
 def read_docx_text(uploaded_file) -> str:
     document = Document(uploaded_file)
     paragraphs = [p.text.strip() for p in document.paragraphs if p.text.strip()]
@@ -727,9 +808,40 @@ def _sanitize_prompt_text(text: str) -> str:
         text,
         flags=re.IGNORECASE,
     )
+    cleaned = re.sub(
+        r"\bcinematic\s*(16:9|21:9|2:1)\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\b\d{1,2}\s*:\s*\d{1,2}\b", "", cleaned)
     cleaned = re.sub(r"\s*,\s*,\s*", ", ", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned.strip(" ,;-")
+
+def _merge_negative_prompts(
+    user_negative: str,
+    item_negative: str,
+    extra_tokens: list[str],
+) -> str:
+    parts = []
+    for entry in (user_negative, item_negative):
+        if entry and entry.strip():
+            parts.append(entry.strip())
+    combined = ", ".join(parts)
+    lower_combined = combined.lower()
+    extras = [token for token in extra_tokens if token.lower() not in lower_combined]
+    if combined and extras:
+        combined = f"{combined}, {', '.join(extras)}"
+    elif extras:
+        combined = ", ".join(extras)
+    return combined.strip(" ,")
+
+def _parse_ratio_tuple(ratio_text: str, fallback: tuple[int, int]) -> tuple[int, int]:
+    match = re.match(r"\s*(\d+)\s*:\s*(\d+)\s*", ratio_text or "")
+    if not match:
+        return fallback
+    return int(match.group(1)), int(match.group(2))
 
 def normalize_location(text: str) -> str:
     cleaned = re.sub(r"[^\w\s]", " ", text.lower())
@@ -969,7 +1081,11 @@ with tabs[0]:
             try:
                 for idx, item in enumerate(items_to_run):
                     seed = build_seed(bg_seed, idx)
-                    negative_prompt = item.get("negative_prompt") or bg_negative.strip()
+                    negative_prompt = _merge_negative_prompts(
+                        bg_negative,
+                        item.get("negative_prompt", ""),
+                        ANTI_LETTERBOX_TOKENS,
+                    )
                     location_key = normalize_location(item.get("location", ""))
                     cached_key, cached_entry, similarity = find_similar_location(
                         location_key,
@@ -1009,29 +1125,33 @@ with tabs[0]:
                     )
                     status.write(f"Provider used: {provider_label}")
                     seed_used = seed_to_use if provider_label == "Stability.ai" else None
-                    if images:
+                    intended_ratio = (2, 1) if panoramic_enabled else (21, 9)
+                    processed_images = [
+                        postprocess_image_bytes(
+                            image_bytes,
+                            intended_ratio_tuple=intended_ratio,
+                            padding_style=panoramic_style,
+                            remove_bars=True,
+                        )
+                        for image_bytes in images
+                    ]
+                    if processed_images:
                         update_location_cache(
                             bg_cache,
                             location_key,
                             item.get("location", ""),
-                            images[0],
+                            processed_images[0],
                             seed_used,
                             prompt_text,
                         )
-                    for image_index, image_bytes in enumerate(images, start=1):
+                    for image_index, image_bytes in enumerate(processed_images, start=1):
                         if bg_count > 1:
                             filename = f"{item['filename']}_{image_index:02d}.png"
                         else:
                             filename = f"{item['filename']}.png"
-                        output_bytes = _apply_panoramic_conversion(
-                            image_bytes,
-                            panoramic_enabled,
-                            panoramic_mode,
-                            panoramic_style,
-                        )
-                        all_outputs.append((filename, output_bytes))
+                        all_outputs.append((filename, image_bytes))
                         st.image(
-                            output_bytes,
+                            image_bytes,
                             caption=f"{filename} • {provider_label}",
                             use_container_width=True,
                         )
@@ -1210,7 +1330,11 @@ with tabs[1]:
                         seed_offset = item_index * 100 + variant_index * 10
                         seed = build_seed(char_seed, seed_offset)
                         view_prompt = f"{item['prompt']}, {variant_suffix}"
-                        negative_prompt = item.get("negative_prompt") or char_negative.strip()
+                        negative_prompt = _merge_negative_prompts(
+                            char_negative,
+                            item.get("negative_prompt", ""),
+                            ANTI_LETTERBOX_TOKENS,
+                        )
                         status.write(f"Generating {item['filename']} {variant_key}…")
                         provider_label = "Stability.ai"
                         base_seed_selected = char_seed > 0
@@ -1233,29 +1357,37 @@ with tabs[1]:
                         )
                         status.write(f"Provider used: {provider_label}")
                         seed_used = seed_to_use if provider_label == "Stability.ai" else None
-                        if variant_index == 0 and images:
+                        intended_ratio = (
+                            (2, 1)
+                            if panoramic_enabled
+                            else _parse_ratio_tuple(char_aspect, (1, 1))
+                        )
+                        processed_images = [
+                            postprocess_image_bytes(
+                                image_bytes,
+                                intended_ratio_tuple=intended_ratio,
+                                padding_style=panoramic_style,
+                                remove_bars=True,
+                            )
+                            for image_bytes in images
+                        ]
+                        if variant_index == 0 and processed_images:
                             update_location_cache(
                                 char_cache,
                                 cache_key,
                                 item.get("filename", ""),
-                                images[0],
+                                processed_images[0],
                                 seed_used,
                                 item["prompt"],
                             )
-                        for image_index, image_bytes in enumerate(images, start=1):
+                        for image_index, image_bytes in enumerate(processed_images, start=1):
                             if char_count > 1:
                                 filename = f"{item['filename']}_{variant_key}_{image_index:02d}.png"
                             else:
                                 filename = f"{item['filename']}_{variant_key}.png"
-                            output_bytes = _apply_panoramic_conversion(
-                                image_bytes,
-                                panoramic_enabled,
-                                panoramic_mode,
-                                panoramic_style,
-                            )
-                            all_outputs.append((filename, output_bytes))
+                            all_outputs.append((filename, image_bytes))
                             st.image(
-                                output_bytes,
+                                image_bytes,
                                 caption=f"{filename} • {provider_label}",
                                 use_container_width=True,
                             )
@@ -1418,7 +1550,11 @@ with tabs[2]:
                 try:
                     for idx, item in enumerate(items_to_run):
                         skybox_seed = build_seed(int(seed), idx)
-                        negative_text = item.get("negative_prompt") or negative
+                        negative_text = _merge_negative_prompts(
+                            negative,
+                            item.get("negative_prompt", ""),
+                            ANTI_LETTERBOX_TOKENS,
+                        )
                         location_key = normalize_location(item.get("location", ""))
                         cached_key, cached_entry, similarity = find_similar_location(
                             location_key,
@@ -1443,10 +1579,11 @@ with tabs[2]:
                             stability_key = stability_api_key()
                             init_bytes, init_seed_used = make_skybox_init_from_stability(
                                 scene_prompt=item["prompt"],
-                                negative_prompt=(item.get("negative_prompt") or negative),
+                                negative_prompt=negative_text,
                                 base_seed=skybox_seed,
                                 api_key=stability_key,
                                 candidates=3,
+                                padding_style=panoramic_style,
                             )
                             init_bytes_generated = init_bytes
                             init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
@@ -1479,11 +1616,17 @@ with tabs[2]:
                         skybox_oid = gen["obfuscated_id"]
                         done = blockade_poll_generation(skybox_oid)
                         skybox_png = download_url_bytes(done["file_url"])
+                        skybox_display = postprocess_image_bytes(
+                            skybox_png,
+                            intended_ratio_tuple=(2, 1),
+                            padding_style=panoramic_style,
+                            remove_bars=True,
+                        )
                         cache_bytes = (
                             init_bytes_uploaded
                             or cached_init_bytes
                             or init_bytes_generated
-                            or skybox_png
+                            or skybox_display
                         )
                         update_location_cache(
                             skybox_cache,
@@ -1494,15 +1637,9 @@ with tabs[2]:
                             item["prompt"],
                         )
                         filename = f"{item['filename']}.png"
-                        output_bytes = _apply_panoramic_conversion(
-                            skybox_png,
-                            panoramic_enabled,
-                            panoramic_mode,
-                            panoramic_style,
-                        )
-                        all_outputs.append((filename, output_bytes))
+                        all_outputs.append((filename, skybox_display))
                         st.image(
-                            output_bytes,
+                            skybox_display,
                             caption=f"{item['filename']} (equirectangular preview)",
                             use_container_width=True,
                         )
@@ -1636,7 +1773,11 @@ with tabs[2]:
             prompt_lines = [line.strip() for line in prompt.splitlines() if line.strip()]
             location_line, remaining_lines = _extract_location_line(prompt_lines)
             prompt_text, prompt_negative = _split_prompt_and_negative(" ".join(remaining_lines).strip())
-            negative_text = prompt_negative or negative
+            negative_text = _merge_negative_prompts(
+                negative,
+                prompt_negative,
+                ANTI_LETTERBOX_TOKENS,
+            )
             location_text = _resolve_location(location_line, prompt_text)
             location_key = normalize_location(location_text)
             skybox_cache = st.session_state["skybox_cache"]
@@ -1670,6 +1811,7 @@ with tabs[2]:
                             base_seed=skybox_seed,
                             api_key=stability_key,
                             candidates=3,
+                            padding_style=panoramic_style,
                         )
                         init_bytes_generated = init_bytes
                         init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
@@ -1705,11 +1847,11 @@ with tabs[2]:
                     done = blockade_poll_generation(skybox_oid)
                     status.write("Skybox complete. Fetching base image…")
                     skybox_png = download_url_bytes(done["file_url"])
-                    skybox_display = _apply_panoramic_conversion(
+                    skybox_display = postprocess_image_bytes(
                         skybox_png,
-                        panoramic_enabled,
-                        panoramic_mode,
-                        panoramic_style,
+                        intended_ratio_tuple=(2, 1),
+                        padding_style=panoramic_style,
+                        remove_bars=True,
                     )
 
                     st.image(
@@ -1721,7 +1863,7 @@ with tabs[2]:
                         init_bytes_uploaded
                         or cached_init_bytes
                         or init_bytes_generated
-                        or skybox_png
+                        or skybox_display
                     )
                     update_location_cache(
                         skybox_cache,
@@ -1760,11 +1902,11 @@ with tabs[2]:
 
                         png_bytes = download_url_bytes(exp_png_done["file_url"])
                         cube_bytes = download_url_bytes(exp_cube_done["file_url"])
-                        png_display = _apply_panoramic_conversion(
+                        png_display = postprocess_image_bytes(
                             png_bytes,
-                            panoramic_enabled,
-                            panoramic_mode,
-                            panoramic_style,
+                            intended_ratio_tuple=(2, 1),
+                            padding_style=panoramic_style,
+                            remove_bars=True,
                         )
 
                         st.download_button(
