@@ -9,6 +9,7 @@ import zipfile
 import requests
 import streamlit as st
 from docx import Document
+from PIL import Image, ImageStat
 
 BLOCKADE_BASE = "https://backend.blockadelabs.com/api/v1"
 STABILITY_CORE_URL = "https://api.stability.ai/v2beta/stable-image/generate/core"
@@ -333,10 +334,33 @@ def openai_image_size(aspect_ratio: str) -> str:
         "1:1": "1024x1024",
         "2:3": "1024x1536",
         "3:2": "1536x1024",
-        "9:16": "1024x1792",
-        "16:9": "1792x1024",
+        "9:16": "1024x1536",
+        "16:9": "1536x1024",
+        "2:1": "1536x1024",
     }
     return size_map.get(aspect_ratio, "1024x1024")
+
+def _pad_image_to_ratio(image_bytes: bytes, ratio_w: int, ratio_h: int) -> bytes:
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        width, height = image.size
+        target_ratio = ratio_w / ratio_h
+        current_ratio = width / height if height else 1
+        if abs(current_ratio - target_ratio) < 0.01:
+            return image_bytes
+        if current_ratio < target_ratio:
+            target_width = int(round(height * target_ratio))
+            target_height = height
+        else:
+            target_width = width
+            target_height = int(round(width / target_ratio))
+        stat = ImageStat.Stat(image)
+        mean = tuple(int(value) for value in stat.mean)
+        background = Image.new(image.mode, (target_width, target_height), mean)
+        offset = ((target_width - width) // 2, (target_height - height) // 2)
+        background.paste(image, offset)
+        buffer = io.BytesIO()
+        background.save(buffer, format="PNG")
+        return buffer.getvalue()
 
 def openai_generate_images(
     prompt: str,
@@ -370,6 +394,8 @@ def openai_generate_images(
         image_url = item.get("url")
         if image_url:
             images.append(download_url_bytes(image_url))
+    if aspect_ratio == "2:1":
+        images = [_pad_image_to_ratio(image, 2, 1) for image in images]
     if not images:
         raise RuntimeError("OpenAI response did not include images.")
     return images
@@ -571,7 +597,7 @@ with tabs[0]:
     )
     bg_aspect = st.selectbox(
         "Aspect ratio",
-        ["1:1", "2:3", "3:2", "9:16", "16:9"],
+        ["1:1", "2:3", "3:2", "9:16", "16:9", "2:1"],
         index=4,
         key="background_aspect",
     )
@@ -791,7 +817,7 @@ with tabs[1]:
     )
     char_aspect = st.selectbox(
         "Aspect ratio",
-        ["1:1", "2:3", "3:2", "9:16", "16:9"],
+        ["1:1", "2:3", "3:2", "9:16", "16:9", "2:1"],
         index=0,
         key="char_aspect",
     )
