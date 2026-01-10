@@ -13,6 +13,7 @@ from PIL import Image, ImageFilter, ImageOps
 
 BLOCKADE_BASE = "https://backend.blockadelabs.com/api/v1"
 STABILITY_CORE_URL = "https://api.stability.ai/v2beta/stable-image/generate/core"
+STABILITY_ULTRA_URL = "https://api.stability.ai/v2beta/stable-image/generate/ultra"
 STABILITY_MAX_UPLOAD_BYTES = 9 * 1024 * 1024
 
 st.set_page_config(page_title="OutPaged Visualizer", layout="wide")
@@ -350,6 +351,76 @@ def stability_generate_images(
         ]
     raise RuntimeError("Stability.ai response did not include images.")
 
+def stability_generate_ultra(
+    prompt: str,
+    negative_prompt: str,
+    seed: int | None,
+    aspect_ratio: str,
+    api_key: str,
+) -> bytes:
+    payload = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "aspect_ratio": aspect_ratio,
+        "output_format": "png",
+    }
+    if seed is not None:
+        payload["seed"] = int(seed)
+
+    files = {key: (None, str(value)) for key, value in payload.items()}
+    resp = requests.post(
+        STABILITY_ULTRA_URL,
+        headers=stability_headers(api_key),
+        files=files,
+        timeout=180,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Stability Ultra error {resp.status_code}: {resp.text}")
+    return resp.content
+
+def make_skybox_init_from_stability(
+    scene_prompt: str,
+    negative_prompt: str,
+    base_seed: int | None,
+    api_key: str,
+    candidates: int = 3,
+) -> tuple[bytes, int | None]:
+    wrapper_prefix = (
+        "wide environment plate, horizon centered, no close foreground, evenly distributed detail, "
+        "panoramic environment map look, seamless left and right edges, calm camera, "
+    )
+    wrapper_suffix = " no people, no text"
+    prompt = f"{wrapper_prefix}{scene_prompt},{wrapper_suffix}"
+
+    source_aspect = "16:9"
+
+    best_bytes = None
+    best_seed = None
+    best_score = None
+
+    seed0 = None if (base_seed is None or base_seed <= 0) else int(base_seed)
+
+    for i in range(candidates):
+        seed_i = None if seed0 is None else seed0 + i
+        raw = stability_generate_ultra(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed_i,
+            aspect_ratio=source_aspect,
+            api_key=api_key,
+        )
+        fixed = prepare_skybox_ready_bytes(raw, target_size=(2048, 1024), make_tileable=True)
+        score = edge_seam_score(fixed)
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best_bytes = fixed
+            best_seed = seed_i
+
+    if best_bytes is None:
+        raise RuntimeError("Stability Ultra did not return any images for skybox init.")
+    return best_bytes, best_seed
+
 def _encode_image_for_upload(image: Image.Image, use_png: bool) -> tuple[bytes, str, str]:
     buffer = io.BytesIO()
     if use_png:
@@ -400,6 +471,96 @@ def _image_to_png_bytes(image: Image.Image) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", optimize=True, compress_level=9)
     return buffer.getvalue()
+
+def _center_crop_to_ratio(img: Image.Image, target_ratio: float) -> Image.Image:
+    width, height = img.size
+    current = width / height
+    if abs(current - target_ratio) < 1e-6:
+        return img
+
+    if current > target_ratio:
+        new_width = int(height * target_ratio)
+        left = (width - new_width) // 2
+        return img.crop((left, 0, left + new_width, height))
+
+    new_height = int(width / target_ratio)
+    top = (height - new_height) // 2
+    return img.crop((0, top, width, top + new_height))
+
+def _make_tileable_horizontal(img: Image.Image, blend_px: int = 64) -> Image.Image:
+    """
+    Makes left/right edges more compatible by doing a wrap shift and blending the seam.
+    This is a lightweight way to reduce visible seams when Skybox wraps the pano.
+    """
+    import numpy as np
+
+    img = img.convert("RGB")
+    width, height = img.size
+
+    shift = width // 2
+    shifted = Image.new("RGB", (width, height))
+    shifted.paste(img.crop((shift, 0, width, height)), (0, 0))
+    shifted.paste(img.crop((0, 0, shift, height)), (width - shift, 0))
+
+    seam_x = width // 2
+    band_left = max(0, seam_x - blend_px)
+    band_right = min(width, seam_x + blend_px)
+
+    left_band = shifted.crop((band_left, 0, seam_x, height))
+    right_band = shifted.crop((seam_x, 0, band_right, height))
+
+    left_arr = np.array(left_band).astype("float32")
+    right_arr = np.array(right_band).astype("float32")
+
+    band_width = right_arr.shape[1]
+    alpha = np.linspace(0.0, 1.0, band_width, dtype="float32")[None, :, None]
+    alpha = np.repeat(alpha, height, axis=0)
+
+    blended = (left_arr[:, :band_width, :] * (1.0 - alpha)) + (right_arr[:, :band_width, :] * alpha)
+    blended_img = Image.fromarray(np.clip(blended, 0, 255).astype("uint8"), mode="RGB")
+
+    out = shifted.copy()
+    out.paste(blended_img, (seam_x, 0))
+
+    unshifted = Image.new("RGB", (width, height))
+    unshifted.paste(out.crop((shift, 0, width, height)), (0, 0))
+    unshifted.paste(out.crop((0, 0, shift, height)), (width - shift, 0))
+    return unshifted
+
+def prepare_skybox_ready_bytes(
+    image_bytes: bytes,
+    target_size: tuple[int, int] = (2048, 1024),
+    make_tileable: bool = True,
+    output_format: str = "PNG",
+) -> bytes:
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image = image.convert("RGB")
+        image = _center_crop_to_ratio(image, 2.0)
+        image = image.resize(target_size, Image.LANCZOS)
+        if make_tileable:
+            image = _make_tileable_horizontal(image, blend_px=64)
+
+        buffer = io.BytesIO()
+        if output_format.upper() in ("JPG", "JPEG"):
+            image.save(buffer, format="JPEG", quality=92, optimize=True, progressive=True)
+        else:
+            image.save(buffer, format="PNG", optimize=True, compress_level=9)
+        return buffer.getvalue()
+
+def edge_seam_score(image_bytes: bytes) -> float:
+    """
+    Lower is better. Measures how similar the left and right edges are.
+    Cheap heuristic to pick the best candidate before spending Skybox credits.
+    """
+    import numpy as np
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image = image.convert("RGB")
+        arr = np.array(image).astype("float32")
+        strip = 16
+        left = arr[:, :strip, :]
+        right = arr[:, -strip:, :]
+        return float(((left - right) ** 2).mean())
 
 def _build_blurred_background(
     image: Image.Image,
@@ -1163,7 +1324,15 @@ with tabs[2]:
             if not skybox_items:
                 st.error("No skybox prompts parsed. Please check your DOCX or pasted text.")
                 st.stop()
-            init_b64 = _b64_of_uploaded_file(init_img) if init_img else None
+            init_b64 = None
+            init_bytes_uploaded = None
+            if init_img:
+                init_bytes_uploaded = prepare_skybox_ready_bytes(
+                    init_img.getvalue(),
+                    target_size=(2048, 1024),
+                    make_tileable=True,
+                )
+                init_b64 = base64.b64encode(init_bytes_uploaded).decode("utf-8")
             control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
             location_cache = st.session_state["location_cache"]
             items_to_run = skybox_items[:1] if preview_skybox else skybox_items
@@ -1188,10 +1357,31 @@ with tabs[2]:
                                 f"({similarity:.2f} match to '{cached_entry.get('location_label', 'unknown')}')."
                             )
                         status.write(f"Generating {item['filename']}…")
+                        init_bytes_generated = None
                         init_b64_to_use = init_b64
                         if cached_init_bytes and init_b64_to_use is None:
                             init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
                             status.write("Reusing cached INIT image for this skybox.")
+                        if init_b64_to_use is None:
+                            stability_key = stability_api_key()
+                            init_bytes, init_seed_used = make_skybox_init_from_stability(
+                                scene_prompt=item["prompt"],
+                                negative_prompt=(item.get("negative_prompt") or negative),
+                                base_seed=skybox_seed,
+                                api_key=stability_key,
+                                candidates=3,
+                            )
+                            init_bytes_generated = init_bytes
+                            init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
+                            update_location_cache(
+                                location_cache,
+                                location_key,
+                                item.get("location", ""),
+                                init_bytes,
+                                init_seed_used,
+                                item["prompt"],
+                            )
+                            status.write("Generated Stability.ai init plate for Skybox.")
                         seed_to_use = skybox_seed
                         if seed_to_use is None and cached_seed is not None:
                             seed_to_use = cached_seed
@@ -1211,11 +1401,17 @@ with tabs[2]:
                         skybox_oid = gen["obfuscated_id"]
                         done = blockade_poll_generation(skybox_oid)
                         skybox_png = download_url_bytes(done["file_url"])
+                        cache_bytes = (
+                            init_bytes_uploaded
+                            or cached_init_bytes
+                            or init_bytes_generated
+                            or skybox_png
+                        )
                         update_location_cache(
                             location_cache,
                             location_key,
                             item.get("location", ""),
-                            skybox_png,
+                            cache_bytes,
                             seed_to_use,
                             item["prompt"],
                         )
@@ -1345,9 +1541,17 @@ with tabs[2]:
             )
     
         gen_btn = st.button("Generate Skybox", type="primary", use_container_width=True, key="skybox_generate")
-    
+
         if gen_btn:
-            init_b64 = _b64_of_uploaded_file(init_img) if init_img else None
+            init_b64 = None
+            init_bytes_uploaded = None
+            if init_img:
+                init_bytes_uploaded = prepare_skybox_ready_bytes(
+                    init_img.getvalue(),
+                    target_size=(2048, 1024),
+                    make_tileable=True,
+                )
+                init_b64 = base64.b64encode(init_bytes_uploaded).decode("utf-8")
             control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
             skybox_seed = None if seed == 0 else int(seed)
             prompt_lines = [line.strip() for line in prompt.splitlines() if line.strip()]
@@ -1374,10 +1578,31 @@ with tabs[2]:
                             "Similar location detected "
                             f"({similarity:.2f} match to '{cached_entry.get('location_label', 'unknown')}')."
                         )
+                    init_bytes_generated = None
                     init_b64_to_use = init_b64
                     if cached_init_bytes and init_b64_to_use is None:
                         init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
                         status.write("Reusing cached INIT image for this skybox.")
+                    if init_b64_to_use is None:
+                        stability_key = stability_api_key()
+                        init_bytes, init_seed_used = make_skybox_init_from_stability(
+                            scene_prompt=prompt_text,
+                            negative_prompt=negative_text,
+                            base_seed=skybox_seed,
+                            api_key=stability_key,
+                            candidates=3,
+                        )
+                        init_bytes_generated = init_bytes
+                        init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
+                        update_location_cache(
+                            location_cache,
+                            location_key,
+                            location_text,
+                            init_bytes,
+                            init_seed_used,
+                            prompt_text,
+                        )
+                        status.write("Generated Stability.ai init plate for Skybox.")
                     seed_to_use = skybox_seed
                     if seed_to_use is None and cached_seed is not None:
                         seed_to_use = cached_seed
@@ -1411,11 +1636,17 @@ with tabs[2]:
                         caption="Skybox (equirectangular preview)",
                         use_container_width=True,
                     )
+                    cache_bytes = (
+                        init_bytes_uploaded
+                        or cached_init_bytes
+                        or init_bytes_generated
+                        or skybox_png
+                    )
                     update_location_cache(
                         location_cache,
                         location_key,
                         location_text,
-                        skybox_png,
+                        cache_bytes,
                         seed_to_use,
                         prompt_text,
                     )
