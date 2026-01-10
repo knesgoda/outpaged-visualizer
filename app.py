@@ -9,7 +9,7 @@ import zipfile
 import requests
 import streamlit as st
 from docx import Document
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 
 BLOCKADE_BASE = "https://backend.blockadelabs.com/api/v1"
 STABILITY_CORE_URL = "https://api.stability.ai/v2beta/stable-image/generate/core"
@@ -18,6 +18,29 @@ STABILITY_MAX_UPLOAD_BYTES = 9 * 1024 * 1024
 st.set_page_config(page_title="OutPaged Visualizer", layout="wide")
 st.title("OutPaged Visualizer")
 st.caption("Bulk-generate backgrounds, character training sets, and skyboxes from your DOCX prompts.")
+
+PADDING_STYLE_OPTIONS = {
+    "Blurred edges": "blur",
+    "Mirrored edges": "mirror",
+    "Solid fill": "solid",
+}
+
+with st.sidebar:
+    st.header("Output options")
+    panoramic_enabled = st.checkbox(
+        "Convert outputs to 2:1 panoramic",
+        value=False,
+        help="Adds padding to reach 2:1 without stretching the image.",
+        key="panoramic_enabled",
+    )
+    panoramic_style_label = st.selectbox(
+        "Panoramic padding style",
+        list(PADDING_STYLE_OPTIONS.keys()),
+        index=0,
+        disabled=not panoramic_enabled,
+        key="panoramic_style",
+    )
+    panoramic_style = PADDING_STYLE_OPTIONS[panoramic_style_label]
 
 if "location_cache" not in st.session_state:
     st.session_state["location_cache"] = {}
@@ -373,6 +396,93 @@ def _prepare_stability_init_image(
 
     return encoded, filename, mime_type, True
 
+def _image_to_png_bytes(image: Image.Image) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True, compress_level=9)
+    return buffer.getvalue()
+
+def _build_blurred_background(
+    image: Image.Image,
+    canvas_width: int,
+    canvas_height: int,
+) -> Image.Image:
+    cover_scale = max(canvas_width / image.width, canvas_height / image.height)
+    cover_size = (max(1, int(image.width * cover_scale)), max(1, int(image.height * cover_scale)))
+    cover = image.resize(cover_size, Image.LANCZOS).filter(ImageFilter.GaussianBlur(radius=24))
+    left = max(0, (cover.width - canvas_width) // 2)
+    upper = max(0, (cover.height - canvas_height) // 2)
+    return cover.crop((left, upper, left + canvas_width, upper + canvas_height))
+
+def _build_mirrored_background(
+    image: Image.Image,
+    canvas_width: int,
+    canvas_height: int,
+) -> Image.Image:
+    tile = Image.new("RGBA", (image.width * 2, image.height * 2))
+    tile.paste(image, (0, 0))
+    tile.paste(ImageOps.mirror(image), (image.width, 0))
+    tile.paste(ImageOps.flip(image), (0, image.height))
+    tile.paste(ImageOps.mirror(ImageOps.flip(image)), (image.width, image.height))
+
+    background = Image.new("RGBA", (canvas_width, canvas_height))
+    for y in range(0, canvas_height, tile.height):
+        for x in range(0, canvas_width, tile.width):
+            background.paste(tile, (x, y))
+    return background
+
+def convert_to_panoramic(
+    image_bytes: bytes,
+    target_ratio: tuple[int, int] = (2, 1),
+    padding_style: str = "blur",
+) -> bytes:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image = image.convert("RGBA")
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return image_bytes
+            target_aspect = target_ratio[0] / target_ratio[1]
+            current_aspect = width / height
+            if current_aspect > target_aspect:
+                canvas_width = width
+                canvas_height = max(1, int(round(width / target_aspect)))
+            else:
+                canvas_height = height
+                canvas_width = max(1, int(round(height * target_aspect)))
+
+            scale = min(canvas_width / width, canvas_height / height)
+            resized_size = (
+                max(1, int(round(width * scale))),
+                max(1, int(round(height * scale))),
+            )
+            resized = image.resize(resized_size, Image.LANCZOS)
+
+            if padding_style == "blur":
+                # Padding uses a blurred stretch of the image to avoid harsh solid bars.
+                background = _build_blurred_background(resized, canvas_width, canvas_height)
+            elif padding_style == "mirror":
+                # Padding mirrors the image edges outward so the extra area feels continuous.
+                background = _build_mirrored_background(resized, canvas_width, canvas_height)
+            else:
+                # Solid padding keeps the focus on the center image without visual noise.
+                background = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 255))
+
+            paste_x = (canvas_width - resized.width) // 2
+            paste_y = (canvas_height - resized.height) // 2
+            background.paste(resized, (paste_x, paste_y), resized)
+            return _image_to_png_bytes(background)
+    except OSError:
+        return image_bytes
+
+def _apply_panoramic_conversion(
+    image_bytes: bytes,
+    enabled: bool,
+    padding_style: str,
+) -> bytes:
+    if not enabled:
+        return image_bytes
+    return convert_to_panoramic(image_bytes, padding_style=padding_style)
+
 def read_docx_text(uploaded_file) -> str:
     document = Document(uploaded_file)
     paragraphs = [p.text.strip() for p in document.paragraphs if p.text.strip()]
@@ -675,9 +785,14 @@ with tabs[0]:
                             filename = f"{item['filename']}_{image_index:02d}.png"
                         else:
                             filename = f"{item['filename']}.png"
-                        all_outputs.append((filename, image_bytes))
-                        st.image(
+                        output_bytes = _apply_panoramic_conversion(
                             image_bytes,
+                            panoramic_enabled,
+                            panoramic_style,
+                        )
+                        all_outputs.append((filename, output_bytes))
+                        st.image(
+                            output_bytes,
                             caption=f"{filename} • {provider_label}",
                             use_container_width=True,
                         )
@@ -899,9 +1014,14 @@ with tabs[1]:
                                 filename = f"{item['filename']}_{variant_key}_{image_index:02d}.png"
                             else:
                                 filename = f"{item['filename']}_{variant_key}.png"
-                            all_outputs.append((filename, image_bytes))
-                            st.image(
+                            output_bytes = _apply_panoramic_conversion(
                                 image_bytes,
+                                panoramic_enabled,
+                                panoramic_style,
+                            )
+                            all_outputs.append((filename, output_bytes))
+                            st.image(
+                                output_bytes,
                                 caption=f"{filename} • {provider_label}",
                                 use_container_width=True,
                             )
@@ -1100,9 +1220,14 @@ with tabs[2]:
                             item["prompt"],
                         )
                         filename = f"{item['filename']}.png"
-                        all_outputs.append((filename, skybox_png))
-                        st.image(
+                        output_bytes = _apply_panoramic_conversion(
                             skybox_png,
+                            panoramic_enabled,
+                            panoramic_style,
+                        )
+                        all_outputs.append((filename, output_bytes))
+                        st.image(
+                            output_bytes,
                             caption=f"{item['filename']} (equirectangular preview)",
                             use_container_width=True,
                         )
@@ -1275,8 +1400,17 @@ with tabs[2]:
                     done = blockade_poll_generation(skybox_oid)
                     status.write("Skybox complete. Fetching base image…")
                     skybox_png = download_url_bytes(done["file_url"])
+                    skybox_display = _apply_panoramic_conversion(
+                        skybox_png,
+                        panoramic_enabled,
+                        panoramic_style,
+                    )
 
-                    st.image(skybox_png, caption="Skybox (equirectangular preview)", use_container_width=True)
+                    st.image(
+                        skybox_display,
+                        caption="Skybox (equirectangular preview)",
+                        use_container_width=True,
+                    )
                     update_location_cache(
                         location_cache,
                         location_key,
@@ -1287,7 +1421,7 @@ with tabs[2]:
                     )
                     st.download_button(
                         "Download equirectangular (base)",
-                        data=skybox_png,
+                        data=skybox_display,
                         file_name="skybox_equirectangular_base.png",
                         mime="image/png",
                     )
@@ -1311,13 +1445,18 @@ with tabs[2]:
     
                         exp_png_done = blockade_poll_export(exp_png["id"])
                         exp_cube_done = blockade_poll_export(exp_cube["id"])
-    
+
                         png_bytes = download_url_bytes(exp_png_done["file_url"])
                         cube_bytes = download_url_bytes(exp_cube_done["file_url"])
-    
+                        png_display = _apply_panoramic_conversion(
+                            png_bytes,
+                            panoramic_enabled,
+                            panoramic_style,
+                        )
+
                         st.download_button(
                             "Download equirectangular PNG (export)",
-                            data=png_bytes,
+                            data=png_display,
                             file_name=f"skybox_{res_choice}_equirectangular.png",
                             mime="image/png",
                         )
