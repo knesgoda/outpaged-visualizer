@@ -351,7 +351,6 @@ def openai_generate_images(
         "prompt": prompt,
         "n": image_count,
         "size": openai_image_size(aspect_ratio),
-        "response_format": "b64_json",
     }
     resp = requests.post(
         OPENAI_IMAGE_URL,
@@ -367,6 +366,10 @@ def openai_generate_images(
         b64_payload = item.get("b64_json")
         if b64_payload:
             images.append(base64.b64decode(b64_payload))
+            continue
+        image_url = item.get("url")
+        if image_url:
+            images.append(download_url_bytes(image_url))
     if not images:
         raise RuntimeError("OpenAI response did not include images.")
     return images
