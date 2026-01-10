@@ -678,7 +678,7 @@ with tabs[0]:
         "text, watermark, logo, low quality, blurry",
         key="background_negative",
     )
-    bg_aspect = "2:1"
+    bg_aspect = "21:9"
     st.text_input(
         "Aspect ratio (locked)",
         value=bg_aspect,
@@ -892,7 +892,7 @@ with tabs[1]:
     )
     char_aspect = st.selectbox(
         "Aspect ratio",
-        ["1:1", "2:3", "3:2", "9:16", "16:9", "2:1"],
+        ["1:1", "2:3", "3:2", "4:5", "5:4", "9:16", "9:21", "16:9", "21:9"],
         index=0,
         key="char_aspect",
     )
