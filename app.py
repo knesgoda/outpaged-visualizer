@@ -26,25 +26,42 @@ PADDING_STYLE_OPTIONS = {
     "Solid fill": "solid",
 }
 
+FRAMING_MODE_OPTIONS = {
+    "Crop to 2:1 (no bars)": "crop",
+    "Pad to 2:1 (no stretch)": "pad",
+}
+
 with st.sidebar:
     st.header("Output options")
     panoramic_enabled = st.checkbox(
-        "Convert outputs to 2:1 panoramic",
+        "Enable 2:1 post-process",
         value=False,
-        help="Adds padding to reach 2:1 without stretching the image.",
+        help="Convert outputs to a 2:1 framing after generation.",
         key="panoramic_enabled",
     )
+    panoramic_mode_label = st.selectbox(
+        "2:1 framing mode",
+        list(FRAMING_MODE_OPTIONS.keys()),
+        index=0,
+        disabled=not panoramic_enabled,
+        key="panoramic_mode",
+    )
+    panoramic_mode = FRAMING_MODE_OPTIONS[panoramic_mode_label]
     panoramic_style_label = st.selectbox(
         "Panoramic padding style",
         list(PADDING_STYLE_OPTIONS.keys()),
         index=0,
-        disabled=not panoramic_enabled,
+        disabled=not panoramic_enabled or panoramic_mode != "pad",
         key="panoramic_style",
     )
     panoramic_style = PADDING_STYLE_OPTIONS[panoramic_style_label]
 
-if "location_cache" not in st.session_state:
-    st.session_state["location_cache"] = {}
+if "bg_cache" not in st.session_state:
+    st.session_state["bg_cache"] = {}
+if "char_cache" not in st.session_state:
+    st.session_state["char_cache"] = {}
+if "skybox_cache" not in st.session_state:
+    st.session_state["skybox_cache"] = {}
 
 def _b64_of_uploaded_file(uploaded_file) -> str:
     data = uploaded_file.getvalue()
@@ -591,58 +608,112 @@ def _build_mirrored_background(
             background.paste(tile, (x, y))
     return background
 
-def convert_to_panoramic(
+def strip_letterbox(
+    image: Image.Image,
+    threshold: int = 8,
+    min_bar_px: int = 24,
+) -> Image.Image:
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    if height < min_bar_px * 2:
+        return image
+
+    pixels = rgb.load()
+
+    def row_is_dark(row_y: int) -> bool:
+        total = 0
+        for x in range(width):
+            r, g, b = pixels[x, row_y]
+            total += r + g + b
+        mean = total / (width * 3)
+        return mean <= threshold
+
+    top = 0
+    while top < height and row_is_dark(top):
+        top += 1
+    bottom = height - 1
+    while bottom >= 0 and row_is_dark(bottom):
+        bottom -= 1
+
+    crop_top = top if top >= min_bar_px else 0
+    crop_bottom = (height - 1 - bottom) if (height - 1 - bottom) >= min_bar_px else 0
+
+    if crop_top == 0 and crop_bottom == 0:
+        return image
+
+    new_bottom = height - crop_bottom
+    if crop_top >= new_bottom:
+        return image
+    return image.crop((0, crop_top, width, new_bottom))
+
+def crop_to_ratio(image: Image.Image, target_ratio: float) -> Image.Image:
+    return _center_crop_to_ratio(image, target_ratio)
+
+def pad_to_ratio(
+    image: Image.Image,
+    target_ratio: float,
+    padding_style: str,
+) -> Image.Image:
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return image
+    current_aspect = width / height
+    if current_aspect > target_ratio:
+        canvas_width = width
+        canvas_height = max(1, int(round(width / target_ratio)))
+    else:
+        canvas_height = height
+        canvas_width = max(1, int(round(height * target_ratio)))
+
+    scale = min(canvas_width / width, canvas_height / height)
+    resized_size = (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
+    resized = image.resize(resized_size, Image.LANCZOS)
+
+    if padding_style == "blur":
+        # Padding uses a blurred stretch of the image to avoid harsh solid bars.
+        background = _build_blurred_background(resized, canvas_width, canvas_height)
+    elif padding_style == "mirror":
+        # Padding mirrors the image edges outward so the extra area feels continuous.
+        background = _build_mirrored_background(resized, canvas_width, canvas_height)
+    else:
+        # Solid padding keeps the focus on the center image without visual noise.
+        background = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 255))
+
+    paste_x = (canvas_width - resized.width) // 2
+    paste_y = (canvas_height - resized.height) // 2
+    background.paste(resized, (paste_x, paste_y), resized)
+    return background
+
+def postprocess_to_2to1(
     image_bytes: bytes,
-    target_ratio: tuple[int, int] = (2, 1),
-    padding_style: str = "blur",
+    enabled: bool,
+    mode: str,
+    padding_style: str,
 ) -> bytes:
+    if not enabled:
+        return image_bytes
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
             image = image.convert("RGBA")
-            width, height = image.size
-            if width <= 0 or height <= 0:
-                return image_bytes
-            target_aspect = target_ratio[0] / target_ratio[1]
-            current_aspect = width / height
-            if current_aspect > target_aspect:
-                canvas_width = width
-                canvas_height = max(1, int(round(width / target_aspect)))
+            image = strip_letterbox(image)
+            if mode == "crop":
+                processed = crop_to_ratio(image, 2.0)
             else:
-                canvas_height = height
-                canvas_width = max(1, int(round(height * target_aspect)))
-
-            scale = min(canvas_width / width, canvas_height / height)
-            resized_size = (
-                max(1, int(round(width * scale))),
-                max(1, int(round(height * scale))),
-            )
-            resized = image.resize(resized_size, Image.LANCZOS)
-
-            if padding_style == "blur":
-                # Padding uses a blurred stretch of the image to avoid harsh solid bars.
-                background = _build_blurred_background(resized, canvas_width, canvas_height)
-            elif padding_style == "mirror":
-                # Padding mirrors the image edges outward so the extra area feels continuous.
-                background = _build_mirrored_background(resized, canvas_width, canvas_height)
-            else:
-                # Solid padding keeps the focus on the center image without visual noise.
-                background = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 255))
-
-            paste_x = (canvas_width - resized.width) // 2
-            paste_y = (canvas_height - resized.height) // 2
-            background.paste(resized, (paste_x, paste_y), resized)
-            return _image_to_png_bytes(background)
+                processed = pad_to_ratio(image, 2.0, padding_style)
+            return _image_to_png_bytes(processed)
     except OSError:
         return image_bytes
 
 def _apply_panoramic_conversion(
     image_bytes: bytes,
     enabled: bool,
+    mode: str,
     padding_style: str,
 ) -> bytes:
-    if not enabled:
-        return image_bytes
-    return convert_to_panoramic(image_bytes, padding_style=padding_style)
+    return postprocess_to_2to1(image_bytes, enabled, mode, padding_style)
 
 def read_docx_text(uploaded_file) -> str:
     document = Document(uploaded_file)
@@ -661,6 +732,11 @@ def _sanitize_prompt_text(text: str) -> str:
     return cleaned.strip(" ,;-")
 
 def normalize_location(text: str) -> str:
+    cleaned = re.sub(r"[^\w\s]", " ", text.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+def normalize_filename(text: str) -> str:
     cleaned = re.sub(r"[^\w\s]", " ", text.lower())
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
@@ -836,7 +912,7 @@ with tabs[0]:
 
     bg_negative = st.text_input(
         "Negative prompt",
-        "text, watermark, logo, low quality, blurry",
+        "text, watermark, logo, low quality, blurry, letterbox, black bars, borders, frame, vignette frame",
         key="background_negative",
     )
     bg_aspect = "21:9"
@@ -885,7 +961,7 @@ with tabs[0]:
         if not bg_items:
             st.error("No background prompts parsed. Please check your DOCX or pasted text.")
             st.stop()
-        location_cache = st.session_state["location_cache"]
+        bg_cache = st.session_state["bg_cache"]
         items_to_run = bg_items[:1] if preview_bg else bg_items
         all_outputs: list[tuple[str, bytes]] = []
         init_bytes = bg_ref_image.getvalue() if bg_ref_image else None
@@ -897,7 +973,7 @@ with tabs[0]:
                     location_key = normalize_location(item.get("location", ""))
                     cached_key, cached_entry, similarity = find_similar_location(
                         location_key,
-                        location_cache,
+                        bg_cache,
                     )
                     cached_init_bytes = None
                     cached_seed = None
@@ -914,8 +990,9 @@ with tabs[0]:
                     if cached_init_bytes and init_bytes_to_use is None:
                         init_bytes_to_use = cached_init_bytes
                         status.write("Reusing cached reference image for this background.")
+                    base_seed_selected = bg_seed > 0
                     seed_to_use = seed
-                    if seed_to_use is None and cached_seed is not None:
+                    if base_seed_selected and cached_seed is not None:
                         seed_to_use = cached_seed
                         status.write(f"Reusing cached seed {seed_to_use} for this background.")
                     stability_key = stability_api_key()
@@ -934,7 +1011,7 @@ with tabs[0]:
                     seed_used = seed_to_use if provider_label == "Stability.ai" else None
                     if images:
                         update_location_cache(
-                            location_cache,
+                            bg_cache,
                             location_key,
                             item.get("location", ""),
                             images[0],
@@ -949,6 +1026,7 @@ with tabs[0]:
                         output_bytes = _apply_panoramic_conversion(
                             image_bytes,
                             panoramic_enabled,
+                            panoramic_mode,
                             panoramic_style,
                         )
                         all_outputs.append((filename, output_bytes))
@@ -1048,7 +1126,7 @@ with tabs[1]:
 
     char_negative = st.text_input(
         "Negative prompt",
-        "text, watermark, logo, blurry, low quality, cropped, extra limbs",
+        "text, watermark, logo, blurry, low quality, cropped, extra limbs, letterbox, black bars, borders, frame, vignette frame",
         key="char_negative",
     )
     char_aspect = st.selectbox(
@@ -1104,7 +1182,7 @@ with tabs[1]:
         if not char_items:
             st.error("No character prompts parsed. Please check your DOCX or pasted text.")
             st.stop()
-        location_cache = st.session_state["location_cache"]
+        char_cache = st.session_state["char_cache"]
         init_bytes = char_ref_image.getvalue() if char_ref_image else None
         variants = [
             ("full_body", full_body_suffix),
@@ -1117,20 +1195,13 @@ with tabs[1]:
         with st.status("Generating character images…", expanded=True) as status:
             try:
                 for item_index, item in enumerate(items_to_run):
-                    location_key = normalize_location(item.get("location", ""))
-                    cached_key, cached_entry, similarity = find_similar_location(
-                        location_key,
-                        location_cache,
-                    )
+                    cache_key = normalize_filename(item.get("filename", ""))
+                    cached_entry = char_cache.get(cache_key)
                     cached_init_bytes = None
                     cached_seed = None
                     if cached_entry:
                         cached_init_bytes = cached_entry.get("image_bytes")
                         cached_seed = cached_entry.get("seed")
-                        status.write(
-                            "Similar location detected "
-                            f"({similarity:.2f} match to '{cached_entry.get('location_label', 'unknown')}')."
-                        )
                     init_bytes_to_use = init_bytes
                     if cached_init_bytes and init_bytes_to_use is None:
                         init_bytes_to_use = cached_init_bytes
@@ -1142,8 +1213,9 @@ with tabs[1]:
                         negative_prompt = item.get("negative_prompt") or char_negative.strip()
                         status.write(f"Generating {item['filename']} {variant_key}…")
                         provider_label = "Stability.ai"
+                        base_seed_selected = char_seed > 0
                         seed_to_use = seed
-                        if seed_to_use is None and cached_seed is not None:
+                        if base_seed_selected and cached_seed is not None:
                             seed_to_use = cached_seed
                             status.write(
                                 f"Reusing cached seed {seed_to_use} for {item['filename']} {variant_key}."
@@ -1163,9 +1235,9 @@ with tabs[1]:
                         seed_used = seed_to_use if provider_label == "Stability.ai" else None
                         if variant_index == 0 and images:
                             update_location_cache(
-                                location_cache,
-                                location_key,
-                                item.get("location", ""),
+                                char_cache,
+                                cache_key,
+                                item.get("filename", ""),
                                 images[0],
                                 seed_used,
                                 item["prompt"],
@@ -1178,6 +1250,7 @@ with tabs[1]:
                             output_bytes = _apply_panoramic_conversion(
                                 image_bytes,
                                 panoramic_enabled,
+                                panoramic_mode,
                                 panoramic_style,
                             )
                             all_outputs.append((filename, output_bytes))
@@ -1276,7 +1349,11 @@ with tabs[2]:
             "Laputan observatory walkway under cold sky light, chalk-marked geometric diagrams, star charts, brass instruments, vivid chalk pastel look",
             key="skybox_prompt",
         )
-        negative = st.text_input("Negative text (optional)", "people, text, watermark", key="skybox_negative")
+        negative = st.text_input(
+            "Negative text (optional)",
+            "people, text, watermark, letterbox, black bars, borders, frame, vignette frame",
+            key="skybox_negative",
+        )
         seed = st.number_input(
             "Seed (0 = random)",
             min_value=0,
@@ -1334,7 +1411,7 @@ with tabs[2]:
                 )
                 init_b64 = base64.b64encode(init_bytes_uploaded).decode("utf-8")
             control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
-            location_cache = st.session_state["location_cache"]
+            skybox_cache = st.session_state["skybox_cache"]
             items_to_run = skybox_items[:1] if preview_skybox else skybox_items
             all_outputs: list[tuple[str, bytes]] = []
             with st.status("Generating skyboxes…", expanded=True) as status:
@@ -1345,7 +1422,7 @@ with tabs[2]:
                         location_key = normalize_location(item.get("location", ""))
                         cached_key, cached_entry, similarity = find_similar_location(
                             location_key,
-                            location_cache,
+                            skybox_cache,
                         )
                         cached_init_bytes = None
                         cached_seed = None
@@ -1374,7 +1451,7 @@ with tabs[2]:
                             init_bytes_generated = init_bytes
                             init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
                             update_location_cache(
-                                location_cache,
+                                skybox_cache,
                                 location_key,
                                 item.get("location", ""),
                                 init_bytes,
@@ -1382,8 +1459,9 @@ with tabs[2]:
                                 item["prompt"],
                             )
                             status.write("Generated Stability.ai init plate for Skybox.")
+                        base_seed_selected = seed > 0
                         seed_to_use = skybox_seed
-                        if seed_to_use is None and cached_seed is not None:
+                        if base_seed_selected and cached_seed is not None:
                             seed_to_use = cached_seed
                             status.write(f"Reusing cached seed {seed_to_use} for this skybox.")
                         gen = blockade_generate_skybox(
@@ -1408,7 +1486,7 @@ with tabs[2]:
                             or skybox_png
                         )
                         update_location_cache(
-                            location_cache,
+                            skybox_cache,
                             location_key,
                             item.get("location", ""),
                             cache_bytes,
@@ -1419,6 +1497,7 @@ with tabs[2]:
                         output_bytes = _apply_panoramic_conversion(
                             skybox_png,
                             panoramic_enabled,
+                            panoramic_mode,
                             panoramic_style,
                         )
                         all_outputs.append((filename, output_bytes))
@@ -1560,10 +1639,10 @@ with tabs[2]:
             negative_text = prompt_negative or negative
             location_text = _resolve_location(location_line, prompt_text)
             location_key = normalize_location(location_text)
-            location_cache = st.session_state["location_cache"]
+            skybox_cache = st.session_state["skybox_cache"]
             cached_key, cached_entry, similarity = find_similar_location(
                 location_key,
-                location_cache,
+                skybox_cache,
             )
             cached_init_bytes = None
             cached_seed = None
@@ -1595,7 +1674,7 @@ with tabs[2]:
                         init_bytes_generated = init_bytes
                         init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
                         update_location_cache(
-                            location_cache,
+                            skybox_cache,
                             location_key,
                             location_text,
                             init_bytes,
@@ -1603,8 +1682,9 @@ with tabs[2]:
                             prompt_text,
                         )
                         status.write("Generated Stability.ai init plate for Skybox.")
+                    base_seed_selected = seed > 0
                     seed_to_use = skybox_seed
-                    if seed_to_use is None and cached_seed is not None:
+                    if base_seed_selected and cached_seed is not None:
                         seed_to_use = cached_seed
                         status.write(f"Reusing cached seed {seed_to_use} for this skybox.")
                     gen = blockade_generate_skybox(
@@ -1628,6 +1708,7 @@ with tabs[2]:
                     skybox_display = _apply_panoramic_conversion(
                         skybox_png,
                         panoramic_enabled,
+                        panoramic_mode,
                         panoramic_style,
                     )
 
@@ -1643,7 +1724,7 @@ with tabs[2]:
                         or skybox_png
                     )
                     update_location_cache(
-                        location_cache,
+                        skybox_cache,
                         location_key,
                         location_text,
                         cache_bytes,
@@ -1682,6 +1763,7 @@ with tabs[2]:
                         png_display = _apply_panoramic_conversion(
                             png_bytes,
                             panoramic_enabled,
+                            panoramic_mode,
                             panoramic_style,
                         )
 
