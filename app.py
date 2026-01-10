@@ -11,6 +11,7 @@ from docx import Document
 
 BLOCKADE_BASE = "https://backend.blockadelabs.com/api/v1"
 STABILITY_CORE_URL = "https://api.stability.ai/v2beta/stable-image/generate/core"
+OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
 
 st.set_page_config(page_title="OutPaged Visualizer", layout="wide")
 st.title("OutPaged Visualizer")
@@ -314,6 +315,58 @@ def stability_generate_images(
         ]
     raise RuntimeError("Stability.ai response did not include images.")
 
+def openai_api_key() -> str:
+    return get_secret("OPENAI_API_KEY")
+
+def openai_headers(api_key: str) -> dict:
+    return {
+        "authorization": f"Bearer {api_key}",
+        "content-type": "application/json",
+    }
+
+def openai_image_size(aspect_ratio: str) -> str:
+    size_map = {
+        "1:1": "1024x1024",
+        "2:3": "1024x1536",
+        "3:2": "1536x1024",
+        "9:16": "1024x1792",
+        "16:9": "1792x1024",
+    }
+    return size_map.get(aspect_ratio, "1024x1024")
+
+def openai_generate_images(
+    prompt: str,
+    image_count: int,
+    aspect_ratio: str,
+    api_key: str,
+):
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY for OpenAI image generation.")
+    payload = {
+        "model": "gpt-image-1",
+        "prompt": prompt,
+        "n": image_count,
+        "size": openai_image_size(aspect_ratio),
+        "response_format": "b64_json",
+    }
+    resp = requests.post(
+        OPENAI_IMAGE_URL,
+        headers=openai_headers(api_key),
+        json=payload,
+        timeout=180,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"OpenAI image error {resp.status_code}: {resp.text}")
+    data = resp.json()
+    images = []
+    for item in data.get("data", []):
+        b64_payload = item.get("b64_json")
+        if b64_payload:
+            images.append(base64.b64decode(b64_payload))
+    if not images:
+        raise RuntimeError("OpenAI response did not include images.")
+    return images
+
 def read_docx_text(uploaded_file) -> str:
     document = Document(uploaded_file)
     paragraphs = [p.text.strip() for p in document.paragraphs if p.text.strip()]
@@ -488,7 +541,7 @@ with tabs[0]:
         if not bg_items:
             st.error("No background prompts parsed. Please check your DOCX or pasted text.")
             st.stop()
-        stability_key = stability_api_key()
+        openai_key = openai_api_key()
         items_to_run = bg_items[:1] if preview_bg else bg_items
         all_outputs: list[tuple[str, bytes]] = []
         init_bytes = bg_ref_image.getvalue() if bg_ref_image else None
@@ -498,23 +551,44 @@ with tabs[0]:
                     seed = build_seed(bg_seed, idx)
                     negative_prompt = item.get("negative_prompt") or bg_negative.strip()
                     status.write(f"Generating {item['filename']}…")
-                    images = stability_generate_images(
-                        prompt=item["prompt"],
-                        negative_prompt=negative_prompt,
-                        seed=seed,
-                        aspect_ratio=bg_aspect,
-                        image_count=bg_count,
-                        api_key=stability_key,
-                        init_image_bytes=init_bytes,
-                        init_strength=bg_strength if init_bytes else None,
-                    )
+                    provider_label = "OpenAI"
+                    try:
+                        images = openai_generate_images(
+                            prompt=item["prompt"],
+                            image_count=bg_count,
+                            aspect_ratio=bg_aspect,
+                            api_key=openai_key,
+                        )
+                    except (requests.exceptions.RequestException, RuntimeError, TimeoutError) as exc:
+                        provider_label = "Stability.ai"
+                        status.write(
+                            f"OpenAI image generation failed for {item['filename']}; "
+                            "falling back to Stability.ai."
+                        )
+                        st.warning(f"OpenAI generation failed for {item['filename']}: {exc}")
+                        stability_key = stability_api_key()
+                        images = stability_generate_images(
+                            prompt=item["prompt"],
+                            negative_prompt=negative_prompt,
+                            seed=seed,
+                            aspect_ratio=bg_aspect,
+                            image_count=bg_count,
+                            api_key=stability_key,
+                            init_image_bytes=init_bytes,
+                            init_strength=bg_strength if init_bytes else None,
+                        )
+                    status.write(f"Provider used: {provider_label}")
                     for image_index, image_bytes in enumerate(images, start=1):
                         if bg_count > 1:
                             filename = f"{item['filename']}_{image_index:02d}.png"
                         else:
                             filename = f"{item['filename']}.png"
                         all_outputs.append((filename, image_bytes))
-                        st.image(image_bytes, caption=filename, use_container_width=True)
+                        st.image(
+                            image_bytes,
+                            caption=f"{filename} • {provider_label}",
+                            use_container_width=True,
+                        )
 
                 if all_outputs:
                     zip_bytes = zip_outputs(all_outputs, "backgrounds")
@@ -662,7 +736,7 @@ with tabs[1]:
         if not char_items:
             st.error("No character prompts parsed. Please check your DOCX or pasted text.")
             st.stop()
-        stability_key = stability_api_key()
+        openai_key = openai_api_key()
         init_bytes = char_ref_image.getvalue() if char_ref_image else None
         variants = [
             ("full_body", full_body_suffix),
@@ -681,23 +755,47 @@ with tabs[1]:
                         view_prompt = f"{item['prompt']}, {variant_suffix}"
                         negative_prompt = item.get("negative_prompt") or char_negative.strip()
                         status.write(f"Generating {item['filename']} {variant_key}…")
-                        images = stability_generate_images(
-                            prompt=view_prompt,
-                            negative_prompt=negative_prompt,
-                            seed=seed,
-                            aspect_ratio=char_aspect,
-                            image_count=char_count,
-                            api_key=stability_key,
-                            init_image_bytes=init_bytes,
-                            init_strength=char_strength if init_bytes else None,
-                        )
+                        provider_label = "OpenAI"
+                        try:
+                            images = openai_generate_images(
+                                prompt=view_prompt,
+                                image_count=char_count,
+                                aspect_ratio=char_aspect,
+                                api_key=openai_key,
+                            )
+                        except (requests.exceptions.RequestException, RuntimeError, TimeoutError) as exc:
+                            provider_label = "Stability.ai"
+                            status.write(
+                                f"OpenAI image generation failed for {item['filename']} "
+                                f"{variant_key}; falling back to Stability.ai."
+                            )
+                            st.warning(
+                                f"OpenAI generation failed for {item['filename']} "
+                                f"{variant_key}: {exc}"
+                            )
+                            stability_key = stability_api_key()
+                            images = stability_generate_images(
+                                prompt=view_prompt,
+                                negative_prompt=negative_prompt,
+                                seed=seed,
+                                aspect_ratio=char_aspect,
+                                image_count=char_count,
+                                api_key=stability_key,
+                                init_image_bytes=init_bytes,
+                                init_strength=char_strength if init_bytes else None,
+                            )
+                        status.write(f"Provider used: {provider_label}")
                         for image_index, image_bytes in enumerate(images, start=1):
                             if char_count > 1:
                                 filename = f"{item['filename']}_{variant_key}_{image_index:02d}.png"
                             else:
                                 filename = f"{item['filename']}_{variant_key}.png"
                             all_outputs.append((filename, image_bytes))
-                            st.image(image_bytes, caption=filename, use_container_width=True)
+                            st.image(
+                                image_bytes,
+                                caption=f"{filename} • {provider_label}",
+                                use_container_width=True,
+                            )
 
                 if all_outputs:
                     zip_bytes = zip_outputs(all_outputs, "characters")
