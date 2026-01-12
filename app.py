@@ -265,6 +265,21 @@ with st.sidebar:
         value=True,
         key="skybox_exclude_animals",
     )
+    exclude_toys = st.checkbox(
+        "Exclude toys/stuffed characters",
+        value=True,
+        key="skybox_exclude_toys",
+    )
+    banned_terms_raw = st.text_area(
+        "Banned terms (comma-separated)",
+        value="",
+        help=(
+            "Words to strip from the scene text before prompt building "
+            "(character names, book title, etc)."
+        ),
+        key="skybox_banned_terms",
+    )
+    banned_terms = [term.strip() for term in banned_terms_raw.split(",") if term.strip()]
     skybox_hard_negative_text = st.text_area(
         "Skybox hard negative list",
         value=SKYBOX_HARD_NEGATIVE_DEFAULT,
@@ -1472,22 +1487,106 @@ def _remove_negative_tokens(negative_text: str, tokens_to_remove: list[str]) -> 
     filtered = [token for token in tokens if token.lower() not in remove_set]
     return ", ".join(filtered)
 
+def _banned_term_pattern(term: str) -> str:
+    escaped = re.escape(term)
+    if not escaped:
+        return ""
+    prefix = r"\b" if re.match(r"^\w", term) else ""
+    suffix = r"\b" if re.search(r"\w$", term) else ""
+    return rf"{prefix}{escaped}{suffix}"
+
+def _strip_banned_terms(text: str, banned_terms: list[str]) -> str:
+    if not text or not banned_terms:
+        return text
+    cleaned = text
+    for term in banned_terms:
+        pattern = _banned_term_pattern(term)
+        if not pattern:
+            continue
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+,", ",", cleaned)
+    cleaned = re.sub(r",\s*,", ", ", cleaned)
+    return cleaned.strip(" ,;-")
+
 def _adjust_skybox_prompts(
     prompt_text: str,
     negative_text: str,
-    minimal_furnishings: bool,
-) -> tuple[str, str]:
-    adjusted_prompt = prompt_text
+    furnishing_mode: str,
+    banned_terms: list[str],
+    exclude_toys: bool,
+) -> tuple[str, str, str, str]:
+    base_prompt = _strip_banned_terms(prompt_text, banned_terms)
+    adjusted_prompt = base_prompt
+    adjusted_init = base_prompt
     adjusted_negative = negative_text
-    if minimal_furnishings:
-        adjusted_prompt = _append_prompt_tokens(
-            adjusted_prompt,
-            ["minimal furnishings", "uncluttered"],
+    adjusted_init_negative = negative_text
+
+    if furnishing_mode == "Architecture only":
+        furnish_tokens = [
+            "empty",
+            "unfurnished",
+            "architecture only",
+            "no loose objects",
+            "no decor props",
+            "clean surfaces",
+            "uncluttered",
+        ]
+        adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
+        adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
+        furnishing_negatives = [
+            "furniture",
+            "chairs",
+            "tables",
+            "desks",
+            "lamps",
+            "rugs",
+            "beds",
+            "sofas",
+            "pianos",
+            "toys",
+        ]
+        adjusted_negative = _merge_negative_prompts(adjusted_negative, "", furnishing_negatives)
+        adjusted_init_negative = _merge_negative_prompts(
+            adjusted_init_negative,
+            "",
+            furnishing_negatives,
         )
-        adjusted_negative = _merge_negative_prompts(adjusted_negative, "", ["no clutter"])
-    else:
+    elif furnishing_mode == "Sparse essentials":
+        furnish_tokens = ["sparse furnishings", "minimal decor", "uncluttered", "clean surfaces"]
+        adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
+        adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
         adjusted_negative = _remove_negative_tokens(adjusted_negative, ["furniture"])
-    return adjusted_prompt, adjusted_negative
+        adjusted_init_negative = _remove_negative_tokens(adjusted_init_negative, ["furniture"])
+    else:
+        furnish_tokens = ["cozy", "tasteful period furnishings"]
+        adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
+        adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
+        adjusted_negative = _remove_negative_tokens(adjusted_negative, ["furniture"])
+        adjusted_init_negative = _remove_negative_tokens(adjusted_init_negative, ["furniture"])
+
+    if exclude_toys:
+        toy_tokens = ["no toys", "no stuffed animals", "no plush", "no dolls", "no mascots"]
+        toy_negatives = [
+            "toy",
+            "toys",
+            "plush",
+            "stuffed animal",
+            "teddy bear",
+            "doll",
+            "mascot",
+            "cartoon character",
+        ]
+        adjusted_prompt = _append_prompt_tokens(adjusted_prompt, toy_tokens)
+        adjusted_init = _append_prompt_tokens(adjusted_init, toy_tokens)
+        adjusted_negative = _merge_negative_prompts(adjusted_negative, "", toy_negatives)
+        adjusted_init_negative = _merge_negative_prompts(
+            adjusted_init_negative,
+            "",
+            toy_negatives,
+        )
+
+    return adjusted_prompt, adjusted_negative, adjusted_init, adjusted_init_negative
 
 def _prepare_skybox_output_bytes(
     image_bytes: bytes,
@@ -2157,11 +2256,11 @@ with tabs[2]:
             "3D watercolor diorama",
             key="skybox_prompt",
         )
-        minimal_furnishings = st.checkbox(
-            "Minimal furnishings",
-            value=True,
-            help="Add minimal furnishings guidance and keep 'no clutter' in negatives.",
-            key="skybox_minimal_furnishings",
+        furnishing_mode = st.selectbox(
+            "Furnishing mode",
+            ["Architecture only", "Sparse essentials", "Cozy furnished"],
+            index=0,
+            key="skybox_furnishing_mode",
         )
         apply_skybox_wrapper = st.checkbox(
             "Apply skybox prompt wrapper",
@@ -2280,10 +2379,17 @@ with tabs[2]:
                         if neutralize_possessives:
                             raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
                         sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
-                        sanitized_prompt, negative_text = _adjust_skybox_prompts(
+                        (
                             sanitized_prompt,
                             negative_text,
-                            minimal_furnishings,
+                            init_prompt_text,
+                            init_negative_text,
+                        ) = _adjust_skybox_prompts(
+                            sanitized_prompt,
+                            negative_text,
+                            furnishing_mode,
+                            banned_terms,
+                            exclude_toys,
                         )
                         scene_prompt = prompt_policy.build_prompt(
                             sanitized_prompt,
@@ -2316,9 +2422,13 @@ with tabs[2]:
                         init_bytes_generated = None
                         init_b64_to_use = init_b64
                         reused_init = False
-                        init_scene_prompt = scene_prompt
+                        init_scene_prompt = prompt_policy.build_prompt(
+                            init_prompt_text,
+                            env_type,
+                            "skybox",
+                        )
                         init_prompt_debug = prompt_policy.build_skybox_init_prompt(
-                            sanitized_prompt,
+                            init_prompt_text,
                             env_type,
                         )
                         if reuse_cache_allowed and cached_init_bytes and init_b64_to_use is None:
@@ -2329,19 +2439,19 @@ with tabs[2]:
                             stability_key = stability_api_key()
                             init_bytes, init_seed_used = make_skybox_init_from_stability(
                                 scene_prompt=init_scene_prompt,
-                                negative_prompt=negative_text,
+                                negative_prompt=init_negative_text,
                                 base_seed=skybox_seed,
                                 api_key=stability_key,
                                 candidates=3,
                                 make_tileable=skybox_tileable_blend,
                                 avoid_blurred_poles=avoid_blurred_poles,
                                 pole_detail_weight=pole_detail_weight,
-                                neutralize_possessives=False,
+                                neutralize_possessives=neutralize_possessives,
                             )
                             init_bytes_generated = init_bytes
                             init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
                             status.write(f"Stability init prompt: {init_prompt_debug}")
-                            status.write(f"Stability init negative: {negative_text}")
+                            status.write(f"Stability init negative: {init_negative_text}")
                             status.write(f"Stability init seed used: {init_seed_used}")
                             status.write(f"Stability init cache reused: {reused_init}")
                             status.write("Generated Stability.ai init plate for Skybox.")
@@ -2352,12 +2462,12 @@ with tabs[2]:
                             )
                         elif reused_init:
                             status.write(f"Stability init prompt (cached): {init_prompt_debug}")
-                            status.write(f"Stability init negative (cached): {negative_text}")
+                            status.write(f"Stability init negative (cached): {init_negative_text}")
                             status.write(f"Stability init seed used (cached): {cached_seed}")
                             status.write("Stability init cache reused: True")
                         else:
                             status.write(f"Stability init prompt (provided): {init_prompt_debug}")
-                            status.write(f"Stability init negative (provided): {negative_text}")
+                            status.write(f"Stability init negative (provided): {init_negative_text}")
                             status.write("Stability init cache reused: False")
                         base_seed_selected = seed > 0
                         seed_to_use = skybox_seed
@@ -2618,10 +2728,17 @@ with tabs[2]:
             if neutralize_possessives:
                 raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
             sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
-            sanitized_prompt, negative_text = _adjust_skybox_prompts(
+            (
                 sanitized_prompt,
                 negative_text,
-                minimal_furnishings,
+                init_prompt_text,
+                init_negative_text,
+            ) = _adjust_skybox_prompts(
+                sanitized_prompt,
+                negative_text,
+                furnishing_mode,
+                banned_terms,
+                exclude_toys,
             )
             scene_prompt = prompt_policy.build_prompt(
                 sanitized_prompt,
@@ -2660,9 +2777,13 @@ with tabs[2]:
                     init_bytes_generated = None
                     init_b64_to_use = init_b64
                     reused_init = False
-                    init_scene_prompt = scene_prompt
+                    init_scene_prompt = prompt_policy.build_prompt(
+                        init_prompt_text,
+                        env_type,
+                        "skybox",
+                    )
                     init_prompt_debug = prompt_policy.build_skybox_init_prompt(
-                        sanitized_prompt,
+                        init_prompt_text,
                         env_type,
                     )
                     if reuse_cache_allowed and cached_init_bytes and init_b64_to_use is None:
@@ -2673,19 +2794,19 @@ with tabs[2]:
                         stability_key = stability_api_key()
                         init_bytes, init_seed_used = make_skybox_init_from_stability(
                             scene_prompt=init_scene_prompt,
-                            negative_prompt=negative_text,
+                            negative_prompt=init_negative_text,
                             base_seed=skybox_seed,
                             api_key=stability_key,
                             candidates=3,
                             make_tileable=skybox_tileable_blend,
                             avoid_blurred_poles=avoid_blurred_poles,
                             pole_detail_weight=pole_detail_weight,
-                            neutralize_possessives=False,
+                            neutralize_possessives=neutralize_possessives,
                         )
                         init_bytes_generated = init_bytes
                         init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
                         status.write(f"Stability init prompt: {init_prompt_debug}")
-                        status.write(f"Stability init negative: {negative_text}")
+                        status.write(f"Stability init negative: {init_negative_text}")
                         status.write(f"Stability init seed used: {init_seed_used}")
                         status.write(f"Stability init cache reused: {reused_init}")
                         status.write("Generated Stability.ai init plate for Skybox.")
@@ -2696,12 +2817,12 @@ with tabs[2]:
                         )
                     elif reused_init:
                         status.write(f"Stability init prompt (cached): {init_prompt_debug}")
-                        status.write(f"Stability init negative (cached): {negative_text}")
+                        status.write(f"Stability init negative (cached): {init_negative_text}")
                         status.write(f"Stability init seed used (cached): {cached_seed}")
                         status.write("Stability init cache reused: True")
                     else:
                         status.write(f"Stability init prompt (provided): {init_prompt_debug}")
-                        status.write(f"Stability init negative (provided): {negative_text}")
+                        status.write(f"Stability init negative (provided): {init_negative_text}")
                         status.write("Stability init cache reused: False")
                     base_seed_selected = seed > 0
                     seed_to_use = skybox_seed
