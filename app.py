@@ -1,6 +1,8 @@
 import base64
 import difflib
 import io
+import json
+import math
 import os
 import re
 import time
@@ -30,6 +32,11 @@ PADDING_STYLE_OPTIONS = {
 FRAMING_MODE_OPTIONS = {
     "Crop to 2:1 (no bars)": "crop",
     "Pad to 2:1 (no stretch)": "pad",
+}
+
+SKYBOX_ASPECT_OPTIONS = {
+    "Crop to 2:1 (recommended)": "crop",
+    "Leave as-is": "leave",
 }
 
 ANTI_LETTERBOX_TOKENS = [
@@ -66,6 +73,20 @@ with st.sidebar:
         key="panoramic_style",
     )
     panoramic_style = PADDING_STYLE_OPTIONS[panoramic_style_label]
+
+    st.header("Reuse options")
+    location_reuse_enabled = st.checkbox(
+        "Enable location-based reuse",
+        value=False,
+        help="Only reuse cached locations when a Location: line is provided.",
+        key="location_reuse_enabled",
+    )
+    reuse_cached_seed = st.checkbox(
+        "Reuse cached seed",
+        value=False,
+        help="Allow cached seeds to override manual seed offsets.",
+        key="reuse_cached_seed",
+    )
 
 if "bg_cache" not in st.session_state:
     st.session_state["bg_cache"] = {}
@@ -412,16 +433,33 @@ def make_skybox_init_from_stability(
     base_seed: int | None,
     api_key: str,
     candidates: int = 3,
-    padding_style: str = "blur",
+    make_tileable: bool = True,
 ) -> tuple[bytes, int | None]:
-    wrapper_prefix = (
-        "wide environment plate, horizon centered, no close foreground, evenly distributed detail, "
-        "panoramic environment map look, seamless left and right edges, calm camera, "
-    )
+    indoor_keywords = [
+        "indoors",
+        "interior",
+        "room",
+        "hallway",
+        "staircase",
+        "nursery",
+        "chamber",
+    ]
+    scene_lower = scene_prompt.lower()
+    is_indoor = any(keyword in scene_lower for keyword in indoor_keywords)
+    if is_indoor:
+        wrapper_prefix = (
+            "interior equirectangular environment plate, centered vanishing point, "
+            "open space at left and right edges, no close foreground, wide angle but not fisheye, "
+        )
+    else:
+        wrapper_prefix = (
+            "equirectangular environment plate, level camera, open space at left and right edges, "
+            "no close foreground, evenly distributed detail, "
+        )
     wrapper_suffix = " no people, no text"
     prompt = f"{wrapper_prefix}{scene_prompt},{wrapper_suffix}"
 
-    source_aspect = "16:9"
+    source_aspect = "21:9"
 
     best_bytes = None
     best_seed = None
@@ -438,14 +476,19 @@ def make_skybox_init_from_stability(
             aspect_ratio=source_aspect,
             api_key=api_key,
         )
-        cleaned = postprocess_image_bytes(
+        cropped = prepare_skybox_ready_bytes(
             raw,
-            intended_ratio_tuple=(2, 1),
-            padding_style=padding_style,
-            remove_bars=True,
+            target_size=(2048, 1024),
+            make_tileable=False,
         )
-        fixed = prepare_skybox_ready_bytes(cleaned, target_size=(2048, 1024), make_tileable=True)
-        score = edge_seam_score(fixed)
+        score = edge_seam_score(cropped)
+        fixed = cropped
+        if make_tileable:
+            fixed = prepare_skybox_ready_bytes(
+                raw,
+                target_size=(2048, 1024),
+                make_tileable=True,
+            )
 
         if best_score is None or score < best_score:
             best_score = score
@@ -809,6 +852,12 @@ def _sanitize_prompt_text(text: str) -> str:
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(
+        r"\baspect\s+ration\b",
+        "aspect ratio",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
         r"\bcinematic\s*(16:9|21:9|2:1)\b",
         "",
         cleaned,
@@ -844,6 +893,8 @@ def _parse_ratio_tuple(ratio_text: str, fallback: tuple[int, int]) -> tuple[int,
     return int(match.group(1)), int(match.group(2))
 
 def normalize_location(text: str) -> str:
+    if not text:
+        return ""
     cleaned = re.sub(r"[^\w\s]", " ", text.lower())
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
@@ -853,25 +904,21 @@ def normalize_filename(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
 
-def _extract_location_line(lines: list[str]) -> tuple[str | None, list[str]]:
+def _extract_location_line(lines: list[str]) -> tuple[str | None, list[str], bool]:
     location = None
     remaining_lines: list[str] = []
+    found = False
     for line in lines:
         match = re.match(r"location\s*:\s*(.+)", line, flags=re.IGNORECASE)
         if match and location is None:
             location = match.group(1).strip()
+            found = True
             continue
         remaining_lines.append(line)
-    return location, remaining_lines
+    return location, remaining_lines, found
 
-def _fallback_location(prompt_text: str, max_len: int = 120) -> str:
-    trimmed = prompt_text.strip()
-    if not trimmed:
-        return "unknown location"
-    return trimmed[:max_len].strip()
-
-def _resolve_location(location: str | None, prompt_text: str) -> str:
-    return location or _fallback_location(prompt_text)
+def _resolve_location(location: str | None) -> str | None:
+    return location.strip() if location else None
 
 def find_similar_location(
     location_key: str,
@@ -933,16 +980,17 @@ def parse_prompt_blocks(text: str, label_patterns: list[str]) -> list[dict]:
                 break
         if match:
             if current_name:
-                location_line, remaining_lines = _extract_location_line(current_lines)
+                location_line, remaining_lines, location_present = _extract_location_line(current_lines)
                 raw_text = " ".join(l for l in remaining_lines if l.strip()).strip()
                 prompt_text, negative_text = _split_prompt_and_negative(raw_text)
-                location_text = _resolve_location(location_line, prompt_text)
+                location_text = _resolve_location(location_line)
                 items.append(
                     {
                         "filename": current_name,
                         "prompt": prompt_text,
                         "negative_prompt": negative_text,
                         "location": location_text,
+                        "location_line_present": location_present,
                     }
                 )
             current_name = match.group("filename").strip()
@@ -950,16 +998,17 @@ def parse_prompt_blocks(text: str, label_patterns: list[str]) -> list[dict]:
         elif current_name:
             current_lines.append(line)
     if current_name:
-        location_line, remaining_lines = _extract_location_line(current_lines)
+        location_line, remaining_lines, location_present = _extract_location_line(current_lines)
         raw_text = " ".join(l for l in remaining_lines if l.strip()).strip()
         prompt_text, negative_text = _split_prompt_and_negative(raw_text)
-        location_text = _resolve_location(location_line, prompt_text)
+        location_text = _resolve_location(location_line)
         items.append(
             {
                 "filename": current_name,
                 "prompt": prompt_text,
                 "negative_prompt": negative_text,
                 "location": location_text,
+                "location_line_present": location_present,
             }
         )
     return [item for item in items if item["filename"] and item["prompt"]]
@@ -969,11 +1018,81 @@ def build_seed(base_seed: int, offset: int) -> int | None:
         return None
     return base_seed + offset
 
-def zip_outputs(file_entries: list[tuple[str, bytes]], folder: str) -> bytes:
+def _format_aspect_ratio(width: int, height: int) -> str:
+    if width <= 0 or height <= 0:
+        return ""
+    gcd = math.gcd(width, height)
+    return f"{width // gcd}:{height // gcd}"
+
+def _aspect_ratio_from_bytes(image_bytes: bytes) -> str:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+        return _format_aspect_ratio(width, height)
+    except OSError:
+        return ""
+
+def _append_prompt_tokens(prompt: str, tokens: list[str]) -> str:
+    if not prompt:
+        return prompt
+    lower_prompt = prompt.lower()
+    additions = [token for token in tokens if token.lower() not in lower_prompt]
+    if not additions:
+        return prompt
+    return f"{prompt}, {', '.join(additions)}"
+
+def _remove_negative_tokens(negative_text: str, tokens_to_remove: list[str]) -> str:
+    if not negative_text:
+        return ""
+    tokens = [token.strip() for token in negative_text.split(",") if token.strip()]
+    remove_set = {token.lower() for token in tokens_to_remove}
+    filtered = [token for token in tokens if token.lower() not in remove_set]
+    return ", ".join(filtered)
+
+def _adjust_skybox_prompts(
+    prompt_text: str,
+    negative_text: str,
+    minimal_furnishings: bool,
+) -> tuple[str, str]:
+    adjusted_prompt = prompt_text
+    adjusted_negative = negative_text
+    if minimal_furnishings:
+        adjusted_prompt = _append_prompt_tokens(
+            adjusted_prompt,
+            ["minimal furnishings", "uncluttered"],
+        )
+        adjusted_negative = _merge_negative_prompts(adjusted_negative, "", ["no clutter"])
+    else:
+        adjusted_negative = _remove_negative_tokens(adjusted_negative, ["furniture"])
+    return adjusted_prompt, adjusted_negative
+
+def _prepare_skybox_output_bytes(
+    image_bytes: bytes,
+    apply_crop: bool,
+    make_tileable: bool,
+    target_size: tuple[int, int] = (2048, 1024),
+) -> tuple[bytes, bool]:
+    if not apply_crop:
+        return image_bytes, False
+    processed = prepare_skybox_ready_bytes(
+        image_bytes,
+        target_size=target_size,
+        make_tileable=make_tileable,
+    )
+    return processed, True
+
+def zip_outputs(
+    file_entries: list[tuple[str, bytes]],
+    folder: str,
+    manifest_entries: list[dict] | None = None,
+) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for filename, data in file_entries:
             zip_file.writestr(f"{folder}/{filename}", data)
+        if manifest_entries is not None:
+            manifest_payload = json.dumps(manifest_entries, indent=2, ensure_ascii=False)
+            zip_file.writestr(f"{folder}/manifest.json", manifest_payload)
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -1076,6 +1195,7 @@ with tabs[0]:
         bg_cache = st.session_state["bg_cache"]
         items_to_run = bg_items[:1] if preview_bg else bg_items
         all_outputs: list[tuple[str, bytes]] = []
+        manifest_entries: list[dict] = []
         init_bytes = bg_ref_image.getvalue() if bg_ref_image else None
         with st.status("Generating backgrounds…", expanded=True) as status:
             try:
@@ -1086,11 +1206,16 @@ with tabs[0]:
                         item.get("negative_prompt", ""),
                         ANTI_LETTERBOX_TOKENS,
                     )
-                    location_key = normalize_location(item.get("location", ""))
-                    cached_key, cached_entry, similarity = find_similar_location(
-                        location_key,
-                        bg_cache,
-                    )
+                    location_key = ""
+                    cached_entry = None
+                    similarity = 0.0
+                    location_line_present = bool(item.get("location_line_present"))
+                    if location_reuse_enabled and location_line_present:
+                        location_key = normalize_location(item.get("location", ""))
+                        _, cached_entry, similarity = find_similar_location(
+                            location_key,
+                            bg_cache,
+                        )
                     cached_init_bytes = None
                     cached_seed = None
                     if cached_entry:
@@ -1103,13 +1228,17 @@ with tabs[0]:
                     status.write(f"Generating {item['filename']}…")
                     provider_label = "Stability.ai"
                     init_bytes_to_use = init_bytes
+                    reused_init = False
                     if cached_init_bytes and init_bytes_to_use is None:
                         init_bytes_to_use = cached_init_bytes
+                        reused_init = True
                         status.write("Reusing cached reference image for this background.")
                     base_seed_selected = bg_seed > 0
                     seed_to_use = seed
-                    if base_seed_selected and cached_seed is not None:
+                    reused_seed = False
+                    if reuse_cached_seed and base_seed_selected and cached_seed is not None:
                         seed_to_use = cached_seed
+                        reused_seed = True
                         status.write(f"Reusing cached seed {seed_to_use} for this background.")
                     stability_key = stability_api_key()
                     prompt_text = _sanitize_prompt_text(item["prompt"])
@@ -1136,20 +1265,36 @@ with tabs[0]:
                         for image_bytes in images
                     ]
                     if processed_images:
-                        update_location_cache(
-                            bg_cache,
-                            location_key,
-                            item.get("location", ""),
-                            processed_images[0],
-                            seed_used,
-                            prompt_text,
-                        )
+                        if location_reuse_enabled and location_line_present:
+                            update_location_cache(
+                                bg_cache,
+                                location_key,
+                                item.get("location", ""),
+                                processed_images[0],
+                                seed_used,
+                                prompt_text,
+                            )
                     for image_index, image_bytes in enumerate(processed_images, start=1):
                         if bg_count > 1:
                             filename = f"{item['filename']}_{image_index:02d}.png"
                         else:
                             filename = f"{item['filename']}.png"
                         all_outputs.append((filename, image_bytes))
+                        manifest_entries.append(
+                            {
+                                "filename": filename,
+                                "provider": provider_label,
+                                "prompt": prompt_text,
+                                "negative_prompt": negative_prompt,
+                                "seed_used": seed_used,
+                                "aspect_ratio": _aspect_ratio_from_bytes(image_bytes),
+                                "init_strength": bg_strength if init_bytes_to_use else None,
+                                "location_based_reuse_enabled": location_reuse_enabled,
+                                "location_line_present": location_line_present,
+                                "reused_cached_init": reused_init,
+                                "reused_cached_seed": reused_seed,
+                            }
+                        )
                         st.image(
                             image_bytes,
                             caption=f"{filename} • {provider_label}",
@@ -1157,7 +1302,7 @@ with tabs[0]:
                         )
 
                 if all_outputs:
-                    zip_bytes = zip_outputs(all_outputs, "backgrounds")
+                    zip_bytes = zip_outputs(all_outputs, "backgrounds", manifest_entries)
                     st.download_button(
                         "Download backgrounds ZIP",
                         data=zip_bytes,
@@ -1312,6 +1457,7 @@ with tabs[1]:
         ]
         items_to_run = char_items[:1] if preview_chars else char_items
         all_outputs: list[tuple[str, bytes]] = []
+        manifest_entries: list[dict] = []
         with st.status("Generating character images…", expanded=True) as status:
             try:
                 for item_index, item in enumerate(items_to_run):
@@ -1323,8 +1469,10 @@ with tabs[1]:
                         cached_init_bytes = cached_entry.get("image_bytes")
                         cached_seed = cached_entry.get("seed")
                     init_bytes_to_use = init_bytes
+                    reused_init = False
                     if cached_init_bytes and init_bytes_to_use is None:
                         init_bytes_to_use = cached_init_bytes
+                        reused_init = True
                         status.write("Reusing cached reference image for this character.")
                     for variant_index, (variant_key, variant_suffix) in enumerate(variants):
                         seed_offset = item_index * 100 + variant_index * 10
@@ -1339,8 +1487,10 @@ with tabs[1]:
                         provider_label = "Stability.ai"
                         base_seed_selected = char_seed > 0
                         seed_to_use = seed
-                        if base_seed_selected and cached_seed is not None:
+                        reused_seed = False
+                        if reuse_cached_seed and base_seed_selected and cached_seed is not None:
                             seed_to_use = cached_seed
+                            reused_seed = True
                             status.write(
                                 f"Reusing cached seed {seed_to_use} for {item['filename']} {variant_key}."
                             )
@@ -1386,6 +1536,19 @@ with tabs[1]:
                             else:
                                 filename = f"{item['filename']}_{variant_key}.png"
                             all_outputs.append((filename, image_bytes))
+                            manifest_entries.append(
+                                {
+                                    "filename": filename,
+                                    "provider": provider_label,
+                                    "prompt": view_prompt,
+                                    "negative_prompt": negative_prompt,
+                                    "seed_used": seed_used,
+                                    "aspect_ratio": _aspect_ratio_from_bytes(image_bytes),
+                                    "init_strength": char_strength if init_bytes_to_use else None,
+                                    "reused_cached_init": reused_init,
+                                    "reused_cached_seed": reused_seed,
+                                }
+                            )
                             st.image(
                                 image_bytes,
                                 caption=f"{filename} • {provider_label}",
@@ -1393,7 +1556,7 @@ with tabs[1]:
                             )
 
                 if all_outputs:
-                    zip_bytes = zip_outputs(all_outputs, "characters")
+                    zip_bytes = zip_outputs(all_outputs, "characters", manifest_entries)
                     st.download_button(
                         "Download character images ZIP",
                         data=zip_bytes,
@@ -1481,10 +1644,28 @@ with tabs[2]:
             "Laputan observatory walkway under cold sky light, chalk-marked geometric diagrams, star charts, brass instruments, vivid chalk pastel look",
             key="skybox_prompt",
         )
+        minimal_furnishings = st.checkbox(
+            "Minimal furnishings",
+            value=True,
+            help="Add minimal furnishings guidance and keep 'no clutter' in negatives.",
+            key="skybox_minimal_furnishings",
+        )
         negative = st.text_input(
             "Negative text (optional)",
             "people, text, watermark, letterbox, black bars, borders, frame, vignette frame",
             key="skybox_negative",
+        )
+        skybox_aspect_label = st.selectbox(
+            "Skybox aspect handling",
+            list(SKYBOX_ASPECT_OPTIONS.keys()),
+            index=0,
+            key="skybox_aspect_handling",
+        )
+        skybox_aspect_mode = SKYBOX_ASPECT_OPTIONS[skybox_aspect_label]
+        skybox_tileable_blend = st.checkbox(
+            "Blend skybox seam (tileable)",
+            value=True,
+            key="skybox_tileable_blend",
         )
         seed = st.number_input(
             "Seed (0 = random)",
@@ -1539,13 +1720,14 @@ with tabs[2]:
                 init_bytes_uploaded = prepare_skybox_ready_bytes(
                     init_img.getvalue(),
                     target_size=(2048, 1024),
-                    make_tileable=True,
+                    make_tileable=skybox_tileable_blend,
                 )
                 init_b64 = base64.b64encode(init_bytes_uploaded).decode("utf-8")
             control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
             skybox_cache = st.session_state["skybox_cache"]
             items_to_run = skybox_items[:1] if preview_skybox else skybox_items
             all_outputs: list[tuple[str, bytes]] = []
+            manifest_entries: list[dict] = []
             with st.status("Generating skyboxes…", expanded=True) as status:
                 try:
                     for idx, item in enumerate(items_to_run):
@@ -1555,11 +1737,21 @@ with tabs[2]:
                             item.get("negative_prompt", ""),
                             ANTI_LETTERBOX_TOKENS,
                         )
-                        location_key = normalize_location(item.get("location", ""))
-                        cached_key, cached_entry, similarity = find_similar_location(
-                            location_key,
-                            skybox_cache,
+                        prompt_text, negative_text = _adjust_skybox_prompts(
+                            item["prompt"],
+                            negative_text,
+                            minimal_furnishings,
                         )
+                        location_key = ""
+                        cached_entry = None
+                        similarity = 0.0
+                        location_line_present = bool(item.get("location_line_present"))
+                        if location_reuse_enabled and location_line_present:
+                            location_key = normalize_location(item.get("location", ""))
+                            _, cached_entry, similarity = find_similar_location(
+                                location_key,
+                                skybox_cache,
+                            )
                         cached_init_bytes = None
                         cached_seed = None
                         if cached_entry:
@@ -1572,37 +1764,42 @@ with tabs[2]:
                         status.write(f"Generating {item['filename']}…")
                         init_bytes_generated = None
                         init_b64_to_use = init_b64
+                        reused_init = False
                         if cached_init_bytes and init_b64_to_use is None:
                             init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
+                            reused_init = True
                             status.write("Reusing cached INIT image for this skybox.")
                         if init_b64_to_use is None:
                             stability_key = stability_api_key()
                             init_bytes, init_seed_used = make_skybox_init_from_stability(
-                                scene_prompt=item["prompt"],
+                                scene_prompt=prompt_text,
                                 negative_prompt=negative_text,
                                 base_seed=skybox_seed,
                                 api_key=stability_key,
                                 candidates=3,
-                                padding_style=panoramic_style,
+                                make_tileable=skybox_tileable_blend,
                             )
                             init_bytes_generated = init_bytes
                             init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
-                            update_location_cache(
-                                skybox_cache,
-                                location_key,
-                                item.get("location", ""),
-                                init_bytes,
-                                init_seed_used,
-                                item["prompt"],
-                            )
+                            if location_reuse_enabled and location_line_present:
+                                update_location_cache(
+                                    skybox_cache,
+                                    location_key,
+                                    item.get("location", ""),
+                                    init_bytes,
+                                    init_seed_used,
+                                    prompt_text,
+                                )
                             status.write("Generated Stability.ai init plate for Skybox.")
                         base_seed_selected = seed > 0
                         seed_to_use = skybox_seed
-                        if base_seed_selected and cached_seed is not None:
+                        reused_seed = False
+                        if reuse_cached_seed and base_seed_selected and cached_seed is not None:
                             seed_to_use = cached_seed
+                            reused_seed = True
                             status.write(f"Reusing cached seed {seed_to_use} for this skybox.")
                         gen = blockade_generate_skybox(
-                            prompt=item["prompt"],
+                            prompt=prompt_text,
                             style_id=style_id,
                             negative_text=negative_text,
                             seed=seed_to_use,
@@ -1616,11 +1813,10 @@ with tabs[2]:
                         skybox_oid = gen["obfuscated_id"]
                         done = blockade_poll_generation(skybox_oid)
                         skybox_png = download_url_bytes(done["file_url"])
-                        skybox_display = postprocess_image_bytes(
+                        skybox_display, cropped_to_2to1 = _prepare_skybox_output_bytes(
                             skybox_png,
-                            intended_ratio_tuple=(2, 1),
-                            padding_style=panoramic_style,
-                            remove_bars=True,
+                            apply_crop=skybox_aspect_mode == "crop",
+                            make_tileable=skybox_tileable_blend,
                         )
                         cache_bytes = (
                             init_bytes_uploaded
@@ -1628,16 +1824,34 @@ with tabs[2]:
                             or init_bytes_generated
                             or skybox_display
                         )
-                        update_location_cache(
-                            skybox_cache,
-                            location_key,
-                            item.get("location", ""),
-                            cache_bytes,
-                            seed_to_use,
-                            item["prompt"],
-                        )
+                        if location_reuse_enabled and location_line_present:
+                            update_location_cache(
+                                skybox_cache,
+                                location_key,
+                                item.get("location", ""),
+                                cache_bytes,
+                                seed_to_use,
+                                prompt_text,
+                            )
                         filename = f"{item['filename']}.png"
                         all_outputs.append((filename, skybox_display))
+                        manifest_entries.append(
+                            {
+                                "filename": filename,
+                                "provider": "Blockade Labs",
+                                "prompt": prompt_text,
+                                "negative_prompt": negative_text,
+                                "seed_used": seed_to_use,
+                                "aspect_ratio": _aspect_ratio_from_bytes(skybox_display),
+                                "init_strength": float(init_strength),
+                                "location_based_reuse_enabled": location_reuse_enabled,
+                                "location_line_present": location_line_present,
+                                "reused_cached_init": reused_init,
+                                "reused_cached_seed": reused_seed,
+                                "cropped_to_2to1": cropped_to_2to1,
+                                "tileable_blend": bool(cropped_to_2to1 and skybox_tileable_blend),
+                            }
+                        )
                         st.image(
                             skybox_display,
                             caption=f"{item['filename']} (equirectangular preview)",
@@ -1645,7 +1859,7 @@ with tabs[2]:
                         )
 
                     if all_outputs:
-                        zip_bytes = zip_outputs(all_outputs, "skyboxes")
+                        zip_bytes = zip_outputs(all_outputs, "skyboxes", manifest_entries)
                         st.download_button(
                             "Download skybox ZIP",
                             data=zip_bytes,
@@ -1765,26 +1979,35 @@ with tabs[2]:
                 init_bytes_uploaded = prepare_skybox_ready_bytes(
                     init_img.getvalue(),
                     target_size=(2048, 1024),
-                    make_tileable=True,
+                    make_tileable=skybox_tileable_blend,
                 )
                 init_b64 = base64.b64encode(init_bytes_uploaded).decode("utf-8")
             control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
             skybox_seed = None if seed == 0 else int(seed)
             prompt_lines = [line.strip() for line in prompt.splitlines() if line.strip()]
-            location_line, remaining_lines = _extract_location_line(prompt_lines)
+            location_line, remaining_lines, location_present = _extract_location_line(prompt_lines)
             prompt_text, prompt_negative = _split_prompt_and_negative(" ".join(remaining_lines).strip())
             negative_text = _merge_negative_prompts(
                 negative,
                 prompt_negative,
                 ANTI_LETTERBOX_TOKENS,
             )
-            location_text = _resolve_location(location_line, prompt_text)
-            location_key = normalize_location(location_text)
-            skybox_cache = st.session_state["skybox_cache"]
-            cached_key, cached_entry, similarity = find_similar_location(
-                location_key,
-                skybox_cache,
+            prompt_text, negative_text = _adjust_skybox_prompts(
+                prompt_text,
+                negative_text,
+                minimal_furnishings,
             )
+            location_text = _resolve_location(location_line)
+            location_key = ""
+            skybox_cache = st.session_state["skybox_cache"]
+            cached_entry = None
+            similarity = 0.0
+            if location_reuse_enabled and location_present and location_text:
+                location_key = normalize_location(location_text)
+                _, cached_entry, similarity = find_similar_location(
+                    location_key,
+                    skybox_cache,
+                )
             cached_init_bytes = None
             cached_seed = None
             if cached_entry:
@@ -1800,8 +2023,10 @@ with tabs[2]:
                         )
                     init_bytes_generated = None
                     init_b64_to_use = init_b64
+                    reused_init = False
                     if cached_init_bytes and init_b64_to_use is None:
                         init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
+                        reused_init = True
                         status.write("Reusing cached INIT image for this skybox.")
                     if init_b64_to_use is None:
                         stability_key = stability_api_key()
@@ -1811,23 +2036,26 @@ with tabs[2]:
                             base_seed=skybox_seed,
                             api_key=stability_key,
                             candidates=3,
-                            padding_style=panoramic_style,
+                            make_tileable=skybox_tileable_blend,
                         )
                         init_bytes_generated = init_bytes
                         init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
-                        update_location_cache(
-                            skybox_cache,
-                            location_key,
-                            location_text,
-                            init_bytes,
-                            init_seed_used,
-                            prompt_text,
-                        )
+                        if location_reuse_enabled and location_present and location_key:
+                            update_location_cache(
+                                skybox_cache,
+                                location_key,
+                                location_text,
+                                init_bytes,
+                                init_seed_used,
+                                prompt_text,
+                            )
                         status.write("Generated Stability.ai init plate for Skybox.")
                     base_seed_selected = seed > 0
                     seed_to_use = skybox_seed
-                    if base_seed_selected and cached_seed is not None:
+                    reused_seed = False
+                    if reuse_cached_seed and base_seed_selected and cached_seed is not None:
                         seed_to_use = cached_seed
+                        reused_seed = True
                         status.write(f"Reusing cached seed {seed_to_use} for this skybox.")
                     gen = blockade_generate_skybox(
                         prompt=prompt_text,
@@ -1847,11 +2075,10 @@ with tabs[2]:
                     done = blockade_poll_generation(skybox_oid)
                     status.write("Skybox complete. Fetching base image…")
                     skybox_png = download_url_bytes(done["file_url"])
-                    skybox_display = postprocess_image_bytes(
+                    skybox_display, cropped_to_2to1 = _prepare_skybox_output_bytes(
                         skybox_png,
-                        intended_ratio_tuple=(2, 1),
-                        padding_style=panoramic_style,
-                        remove_bars=True,
+                        apply_crop=skybox_aspect_mode == "crop",
+                        make_tileable=skybox_tileable_blend,
                     )
 
                     st.image(
@@ -1865,14 +2092,15 @@ with tabs[2]:
                         or init_bytes_generated
                         or skybox_display
                     )
-                    update_location_cache(
-                        skybox_cache,
-                        location_key,
-                        location_text,
-                        cache_bytes,
-                        seed_to_use,
-                        prompt_text,
-                    )
+                    if location_reuse_enabled and location_present and location_key:
+                        update_location_cache(
+                            skybox_cache,
+                            location_key,
+                            location_text,
+                            cache_bytes,
+                            seed_to_use,
+                            prompt_text,
+                        )
                     st.download_button(
                         "Download equirectangular (base)",
                         data=skybox_display,
@@ -1902,11 +2130,10 @@ with tabs[2]:
 
                         png_bytes = download_url_bytes(exp_png_done["file_url"])
                         cube_bytes = download_url_bytes(exp_cube_done["file_url"])
-                        png_display = postprocess_image_bytes(
+                        png_display, _ = _prepare_skybox_output_bytes(
                             png_bytes,
-                            intended_ratio_tuple=(2, 1),
-                            padding_style=panoramic_style,
-                            remove_bars=True,
+                            apply_crop=skybox_aspect_mode == "crop",
+                            make_tileable=skybox_tileable_blend,
                         )
 
                         st.download_button(
