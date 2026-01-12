@@ -64,6 +64,25 @@ SKYBOX_INIT_DETAIL_TOKENS = [
     "detailed ceiling beams/plaster texture at zenith",
     "detailed floorboards/rug texture at nadir",
 ]
+SKYBOX_ENVIRONMENT_PREFIX = (
+    "empty environment, architecture only, no characters, no mascots, no toys, no dolls, "
+    "no stuffed animals, no props, no staged objects, no foreground subject, "
+)
+SKYBOX_INIT_WRAPPER_PREFIX = (
+    "empty architectural interior or landscape, wide environment plate, level camera, "
+    "horizon centered, no props, no toys, no foreground subject, evenly distributed detail, "
+)
+SKYBOX_INIT_WRAPPER_SUFFIX = (
+    ", watercolor diorama look, soft natural light, no people, no animals, "
+    "no characters, no text, no logos"
+)
+SKYBOX_HARD_NEGATIVE_DEFAULT = (
+    "people, person, face, humanoid, character, mascot, cartoon, "
+    "toy, doll, plush, stuffed animal, teddy bear, figurine, puppet, "
+    "camera, film camera, tripod, lens, projector, studio equipment, microphone, "
+    "phone, smartphone, computer, television, electronics, wires, cables, UI, "
+    "text, letters, signage, watermark, logo"
+)
 
 with st.sidebar:
     st.header("Output options")
@@ -91,6 +110,12 @@ with st.sidebar:
     panoramic_style = PADDING_STYLE_OPTIONS[panoramic_style_label]
 
     st.header("Reuse options")
+    reuse_location_cache = st.checkbox(
+        "Reuse location cache",
+        value=True,
+        help="Disable to avoid reusing cached init images or cached seeds.",
+        key="reuse_location_cache",
+    )
     location_reuse_enabled = st.checkbox(
         "Enable location-based reuse",
         value=False,
@@ -103,6 +128,12 @@ with st.sidebar:
         help="Allow cached seeds to override manual seed offsets.",
         key="reuse_cached_seed",
     )
+    if st.button("Clear location cache", key="clear_location_cache"):
+        st.session_state["bg_cache"] = {}
+        st.session_state["char_cache"] = {}
+        st.session_state["skybox_cache"] = {}
+        st.session_state["location_cache"] = {}
+        st.success("Cleared location cache.")
     st.header("Skybox init scoring")
     avoid_blurred_poles = st.checkbox(
         "Avoid blurred skybox poles (prefer ceiling/floor detail)",
@@ -118,6 +149,23 @@ with st.sidebar:
         disabled=not avoid_blurred_poles,
         key="skybox_pole_detail_weight",
     )
+    st.header("Skybox safeguards")
+    neutralize_possessives = st.checkbox(
+        "Neutralize character-name possessives",
+        value=True,
+        key="skybox_neutralize_possessives",
+    )
+    skybox_exclude_animals = st.checkbox(
+        "Skyboxes: exclude animals",
+        value=True,
+        key="skybox_exclude_animals",
+    )
+    skybox_hard_negative_text = st.text_area(
+        "Skybox hard negative list",
+        value=SKYBOX_HARD_NEGATIVE_DEFAULT,
+        height=140,
+        key="skybox_hard_negative_text",
+    )
 
 if "bg_cache" not in st.session_state:
     st.session_state["bg_cache"] = {}
@@ -125,6 +173,8 @@ if "char_cache" not in st.session_state:
     st.session_state["char_cache"] = {}
 if "skybox_cache" not in st.session_state:
     st.session_state["skybox_cache"] = {}
+if "location_cache" not in st.session_state:
+    st.session_state["location_cache"] = {}
 
 def _b64_of_uploaded_file(uploaded_file) -> str:
     data = uploaded_file.getvalue()
@@ -467,31 +517,13 @@ def make_skybox_init_from_stability(
     make_tileable: bool = True,
     avoid_blurred_poles: bool = True,
     pole_detail_weight: float = POLE_DETAIL_WEIGHT_DEFAULT,
+    neutralize_possessives: bool = False,
 ) -> tuple[bytes, int | None]:
-    indoor_keywords = [
-        "indoors",
-        "interior",
-        "room",
-        "hallway",
-        "staircase",
-        "nursery",
-        "chamber",
-    ]
-    scene_lower = scene_prompt.lower()
-    is_indoor = any(keyword in scene_lower for keyword in indoor_keywords)
-    base_wrapper = ", ".join(SKYBOX_PROMPT_WRAPPER_TOKENS + SKYBOX_INIT_DETAIL_TOKENS)
-    if is_indoor:
-        wrapper_prefix = (
-            "interior equirectangular environment plate, centered vanishing point, "
-            "open space at left and right edges, no close foreground, "
-        )
-    else:
-        wrapper_prefix = (
-            "equirectangular environment plate, level camera, open space at left and right edges, "
-            "no close foreground, evenly distributed detail, "
-        )
-    wrapper_suffix = " no people, no text"
-    prompt = f"{wrapper_prefix}{base_wrapper}, {scene_prompt},{wrapper_suffix}"
+    if neutralize_possessives:
+        scene_prompt = neutralize_character_possessives(scene_prompt)
+    scene_prompt = sanitize_skybox_prompt(scene_prompt)
+    scene_prompt = _apply_skybox_environment_prefix(scene_prompt)
+    prompt = _build_skybox_init_prompt(scene_prompt)
 
     source_aspect = "21:9"
 
@@ -938,15 +970,82 @@ def _sanitize_prompt_text(text: str) -> str:
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(
+        r"\b\d{1,2}\s*:\s*\d{1,2}\s*(aspect\s*ratio)?\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\baspect\s*ratio\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
         r"\bcinematic\s*(16:9|21:9|2:1)\b",
         "",
         cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned = re.sub(r"\b\d{1,2}\s*:\s*\d{1,2}\b", "", cleaned)
+    cleaned = re.sub(
+        r"\b(equirectangular|panoramic|panorama|skybox|environment\s*map)\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\b360(?:°)?\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*,\s*,\s*", ", ", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned.strip(" ,;-")
+
+def sanitize_skybox_prompt(text: str) -> str:
+    cleaned = _sanitize_prompt_text(text)
+    cleaned = re.sub(
+        r"\b(equirectangular|panoramic|panorama|skybox|environment\s*map|env\s*map)\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\b360(?:°)?\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*,\s*,\s*", ", ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip(" ,;-")
+
+def neutralize_character_possessives(text: str) -> str:
+    pattern = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s*['’]s\b")
+    workplace_words = {"lab", "laboratory", "study", "office", "workshop"}
+    child_words = {"nursery", "bedroom", "playroom"}
+
+    def replacer(match: re.Match) -> str:
+        remainder = match.string[match.end():]
+        next_word_match = re.search(r"\s+([A-Za-z][\w-]*)", remainder)
+        next_word = next_word_match.group(1).lower() if next_word_match else ""
+        if next_word in workplace_words:
+            return "a private"
+        if next_word in child_words:
+            return "a child's"
+        return "a"
+
+    return pattern.sub(replacer, text)
+
+def _split_negative_tokens(text: str) -> list[str]:
+    if not text:
+        return []
+    tokens = []
+    for part in re.split(r"[,\n]+", text):
+        token = part.strip()
+        if token:
+            tokens.append(token)
+    return tokens
+
+def _apply_skybox_environment_prefix(prompt: str) -> str:
+    if not prompt:
+        return SKYBOX_ENVIRONMENT_PREFIX.strip()
+    return f"{SKYBOX_ENVIRONMENT_PREFIX}{prompt}"
+
+def _build_skybox_init_prompt(scene_prompt: str) -> str:
+    base_wrapper = ", ".join(SKYBOX_PROMPT_WRAPPER_TOKENS + SKYBOX_INIT_DETAIL_TOKENS)
+    return f"{SKYBOX_INIT_WRAPPER_PREFIX}{base_wrapper}, {scene_prompt}{SKYBOX_INIT_WRAPPER_SUFFIX}"
 
 def _merge_negative_prompts(
     user_negative: str,
@@ -1296,7 +1395,7 @@ with tabs[0]:
                     cached_entry = None
                     similarity = 0.0
                     location_line_present = bool(item.get("location_line_present"))
-                    if location_reuse_enabled and location_line_present:
+                    if reuse_location_cache and location_reuse_enabled and location_line_present:
                         location_key = normalize_location(item.get("location", ""))
                         _, cached_entry, similarity = find_similar_location(
                             location_key,
@@ -1315,14 +1414,19 @@ with tabs[0]:
                     provider_label = "Stability.ai"
                     init_bytes_to_use = init_bytes
                     reused_init = False
-                    if cached_init_bytes and init_bytes_to_use is None:
+                    if reuse_location_cache and cached_init_bytes and init_bytes_to_use is None:
                         init_bytes_to_use = cached_init_bytes
                         reused_init = True
                         status.write("Reusing cached reference image for this background.")
                     base_seed_selected = bg_seed > 0
                     seed_to_use = seed
                     reused_seed = False
-                    if reuse_cached_seed and base_seed_selected and cached_seed is not None:
+                    if (
+                        reuse_location_cache
+                        and reuse_cached_seed
+                        and base_seed_selected
+                        and cached_seed is not None
+                    ):
                         seed_to_use = cached_seed
                         reused_seed = True
                         status.write(f"Reusing cached seed {seed_to_use} for this background.")
@@ -1351,7 +1455,7 @@ with tabs[0]:
                         for image_bytes in images
                     ]
                     if processed_images:
-                        if location_reuse_enabled and location_line_present:
+                        if reuse_location_cache and location_reuse_enabled and location_line_present:
                             update_location_cache(
                                 bg_cache,
                                 location_key,
@@ -1548,7 +1652,7 @@ with tabs[1]:
             try:
                 for item_index, item in enumerate(items_to_run):
                     cache_key = normalize_filename(item.get("filename", ""))
-                    cached_entry = char_cache.get(cache_key)
+                    cached_entry = char_cache.get(cache_key) if reuse_location_cache else None
                     cached_init_bytes = None
                     cached_seed = None
                     if cached_entry:
@@ -1556,7 +1660,7 @@ with tabs[1]:
                         cached_seed = cached_entry.get("seed")
                     init_bytes_to_use = init_bytes
                     reused_init = False
-                    if cached_init_bytes and init_bytes_to_use is None:
+                    if reuse_location_cache and cached_init_bytes and init_bytes_to_use is None:
                         init_bytes_to_use = cached_init_bytes
                         reused_init = True
                         status.write("Reusing cached reference image for this character.")
@@ -1574,7 +1678,12 @@ with tabs[1]:
                         base_seed_selected = char_seed > 0
                         seed_to_use = seed
                         reused_seed = False
-                        if reuse_cached_seed and base_seed_selected and cached_seed is not None:
+                        if (
+                            reuse_location_cache
+                            and reuse_cached_seed
+                            and base_seed_selected
+                            and cached_seed is not None
+                        ):
                             seed_to_use = cached_seed
                             reused_seed = True
                             status.write(
@@ -1607,7 +1716,7 @@ with tabs[1]:
                             )
                             for image_bytes in images
                         ]
-                        if variant_index == 0 and processed_images:
+                        if reuse_location_cache and variant_index == 0 and processed_images:
                             update_location_cache(
                                 char_cache,
                                 cache_key,
@@ -1724,10 +1833,16 @@ with tabs[2]:
                 "'Skybox file name: <name>' or 'Skybox filename: <name>'."
             )
 
+        hard_negative_tokens = _split_negative_tokens(skybox_hard_negative_text)
+        if skybox_exclude_animals:
+            hard_negative_tokens.extend(["animals", "birds", "insects"])
+
         st.markdown("**Single prompt**")
         prompt = st.text_area(
             "Skybox Prompt",
-            "Laputan observatory walkway under cold sky light, chalk-marked geometric diagrams, star charts, brass instruments, vivid chalk pastel look",
+            "ground view, center eye level, indoors child’s nursery staircase landing, "
+            "early 20th-century English cottage, morning light through window, warm cozy shadows, "
+            "3D watercolor diorama",
             key="skybox_prompt",
         )
         minimal_furnishings = st.checkbox(
@@ -1744,8 +1859,7 @@ with tabs[2]:
         )
         negative = st.text_input(
             "Negative text (optional)",
-            "people, text, watermark, letterbox, black bars, borders, frame, vignette frame, "
-            "teddy bear, stuffed animal, plush toy, doll, toy, cartoon character",
+            "people, text, watermark, letterbox, black bars, borders, frame, vignette frame",
             key="skybox_negative",
         )
         skybox_aspect_label = st.selectbox(
@@ -1830,19 +1944,29 @@ with tabs[2]:
                             item.get("negative_prompt", ""),
                             ANTI_LETTERBOX_TOKENS,
                         )
-                        prompt_text, negative_text = _adjust_skybox_prompts(
-                            item["prompt"],
+                        negative_text = _merge_negative_prompts(
+                            negative_text,
+                            "",
+                            hard_negative_tokens,
+                        )
+                        raw_prompt_text = item["prompt"]
+                        if neutralize_possessives:
+                            raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
+                        sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
+                        sanitized_prompt, negative_text = _adjust_skybox_prompts(
+                            sanitized_prompt,
                             negative_text,
                             minimal_furnishings,
                         )
+                        scene_prompt = _apply_skybox_environment_prefix(sanitized_prompt)
                         blockade_prompt = (
-                            _apply_skybox_wrapper(prompt_text) if apply_skybox_wrapper else prompt_text
+                            _apply_skybox_wrapper(scene_prompt) if apply_skybox_wrapper else scene_prompt
                         )
                         location_key = ""
                         cached_entry = None
                         similarity = 0.0
                         location_line_present = bool(item.get("location_line_present"))
-                        if location_reuse_enabled and location_line_present:
+                        if reuse_location_cache and location_reuse_enabled and location_line_present:
                             location_key = normalize_location(item.get("location", ""))
                             _, cached_entry, similarity = find_similar_location(
                                 location_key,
@@ -1861,14 +1985,16 @@ with tabs[2]:
                         init_bytes_generated = None
                         init_b64_to_use = init_b64
                         reused_init = False
-                        if cached_init_bytes and init_b64_to_use is None:
+                        init_scene_prompt = _apply_skybox_environment_prefix(sanitized_prompt)
+                        init_prompt_debug = _build_skybox_init_prompt(init_scene_prompt)
+                        if reuse_location_cache and cached_init_bytes and init_b64_to_use is None:
                             init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
                             reused_init = True
                             status.write("Reusing cached INIT image for this skybox.")
                         if init_b64_to_use is None:
                             stability_key = stability_api_key()
                             init_bytes, init_seed_used = make_skybox_init_from_stability(
-                                scene_prompt=prompt_text,
+                                scene_prompt=sanitized_prompt,
                                 negative_prompt=negative_text,
                                 base_seed=skybox_seed,
                                 api_key=stability_key,
@@ -1876,10 +2002,15 @@ with tabs[2]:
                                 make_tileable=skybox_tileable_blend,
                                 avoid_blurred_poles=avoid_blurred_poles,
                                 pole_detail_weight=pole_detail_weight,
+                                neutralize_possessives=False,
                             )
                             init_bytes_generated = init_bytes
                             init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
-                            if location_reuse_enabled and location_line_present:
+                            status.write(f"Stability init prompt: {init_prompt_debug}")
+                            status.write(f"Stability init negative: {negative_text}")
+                            status.write(f"Stability init seed used: {init_seed_used}")
+                            status.write(f"Stability init cache reused: {reused_init}")
+                            if reuse_location_cache and location_reuse_enabled and location_line_present:
                                 update_location_cache(
                                     skybox_cache,
                                     location_key,
@@ -1889,13 +2020,31 @@ with tabs[2]:
                                     blockade_prompt,
                                 )
                             status.write("Generated Stability.ai init plate for Skybox.")
+                        elif reused_init:
+                            status.write(f"Stability init prompt (cached): {init_prompt_debug}")
+                            status.write(f"Stability init negative (cached): {negative_text}")
+                            status.write(f"Stability init seed used (cached): {cached_seed}")
+                            status.write("Stability init cache reused: True")
+                        else:
+                            status.write(f"Stability init prompt (provided): {init_prompt_debug}")
+                            status.write(f"Stability init negative (provided): {negative_text}")
+                            status.write("Stability init cache reused: False")
                         base_seed_selected = seed > 0
                         seed_to_use = skybox_seed
                         reused_seed = False
-                        if reuse_cached_seed and base_seed_selected and cached_seed is not None:
+                        if (
+                            reuse_location_cache
+                            and reuse_cached_seed
+                            and base_seed_selected
+                            and cached_seed is not None
+                        ):
                             seed_to_use = cached_seed
                             reused_seed = True
                             status.write(f"Reusing cached seed {seed_to_use} for this skybox.")
+                        status.write(f"Blockade prompt: {blockade_prompt}")
+                        status.write(f"Blockade negative: {negative_text}")
+                        status.write(f"Blockade cache reused (init/seed): {reused_init}/{reused_seed}")
+                        status.write(f"Blockade seed used: {seed_to_use}")
                         gen = blockade_generate_skybox(
                             prompt=blockade_prompt,
                             style_id=style_id,
@@ -1922,7 +2071,7 @@ with tabs[2]:
                             or init_bytes_generated
                             or skybox_display
                         )
-                        if location_reuse_enabled and location_line_present:
+                        if reuse_location_cache and location_reuse_enabled and location_line_present:
                             update_location_cache(
                                 skybox_cache,
                                 location_key,
@@ -2090,20 +2239,30 @@ with tabs[2]:
                 prompt_negative,
                 ANTI_LETTERBOX_TOKENS,
             )
-            prompt_text, negative_text = _adjust_skybox_prompts(
-                prompt_text,
+            negative_text = _merge_negative_prompts(
+                negative_text,
+                "",
+                hard_negative_tokens,
+            )
+            raw_prompt_text = prompt_text
+            if neutralize_possessives:
+                raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
+            sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
+            sanitized_prompt, negative_text = _adjust_skybox_prompts(
+                sanitized_prompt,
                 negative_text,
                 minimal_furnishings,
             )
+            scene_prompt = _apply_skybox_environment_prefix(sanitized_prompt)
             blockade_prompt = (
-                _apply_skybox_wrapper(prompt_text) if apply_skybox_wrapper else prompt_text
+                _apply_skybox_wrapper(scene_prompt) if apply_skybox_wrapper else scene_prompt
             )
             location_text = _resolve_location(location_line)
             location_key = ""
             skybox_cache = st.session_state["skybox_cache"]
             cached_entry = None
             similarity = 0.0
-            if location_reuse_enabled and location_present and location_text:
+            if reuse_location_cache and location_reuse_enabled and location_present and location_text:
                 location_key = normalize_location(location_text)
                 _, cached_entry, similarity = find_similar_location(
                     location_key,
@@ -2125,14 +2284,16 @@ with tabs[2]:
                     init_bytes_generated = None
                     init_b64_to_use = init_b64
                     reused_init = False
-                    if cached_init_bytes and init_b64_to_use is None:
+                    init_scene_prompt = _apply_skybox_environment_prefix(sanitized_prompt)
+                    init_prompt_debug = _build_skybox_init_prompt(init_scene_prompt)
+                    if reuse_location_cache and cached_init_bytes and init_b64_to_use is None:
                         init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
                         reused_init = True
                         status.write("Reusing cached INIT image for this skybox.")
                     if init_b64_to_use is None:
                         stability_key = stability_api_key()
                         init_bytes, init_seed_used = make_skybox_init_from_stability(
-                            scene_prompt=prompt_text,
+                            scene_prompt=sanitized_prompt,
                             negative_prompt=negative_text,
                             base_seed=skybox_seed,
                             api_key=stability_key,
@@ -2140,10 +2301,15 @@ with tabs[2]:
                             make_tileable=skybox_tileable_blend,
                             avoid_blurred_poles=avoid_blurred_poles,
                             pole_detail_weight=pole_detail_weight,
+                            neutralize_possessives=False,
                         )
                         init_bytes_generated = init_bytes
                         init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
-                        if location_reuse_enabled and location_present and location_key:
+                        status.write(f"Stability init prompt: {init_prompt_debug}")
+                        status.write(f"Stability init negative: {negative_text}")
+                        status.write(f"Stability init seed used: {init_seed_used}")
+                        status.write(f"Stability init cache reused: {reused_init}")
+                        if reuse_location_cache and location_reuse_enabled and location_present and location_key:
                             update_location_cache(
                                 skybox_cache,
                                 location_key,
@@ -2153,13 +2319,31 @@ with tabs[2]:
                                 blockade_prompt,
                             )
                         status.write("Generated Stability.ai init plate for Skybox.")
+                    elif reused_init:
+                        status.write(f"Stability init prompt (cached): {init_prompt_debug}")
+                        status.write(f"Stability init negative (cached): {negative_text}")
+                        status.write(f"Stability init seed used (cached): {cached_seed}")
+                        status.write("Stability init cache reused: True")
+                    else:
+                        status.write(f"Stability init prompt (provided): {init_prompt_debug}")
+                        status.write(f"Stability init negative (provided): {negative_text}")
+                        status.write("Stability init cache reused: False")
                     base_seed_selected = seed > 0
                     seed_to_use = skybox_seed
                     reused_seed = False
-                    if reuse_cached_seed and base_seed_selected and cached_seed is not None:
+                    if (
+                        reuse_location_cache
+                        and reuse_cached_seed
+                        and base_seed_selected
+                        and cached_seed is not None
+                    ):
                         seed_to_use = cached_seed
                         reused_seed = True
                         status.write(f"Reusing cached seed {seed_to_use} for this skybox.")
+                    status.write(f"Blockade prompt: {blockade_prompt}")
+                    status.write(f"Blockade negative: {negative_text}")
+                    status.write(f"Blockade cache reused (init/seed): {reused_init}/{reused_seed}")
+                    status.write(f"Blockade seed used: {seed_to_use}")
                     gen = blockade_generate_skybox(
                         prompt=blockade_prompt,
                         style_id=style_id,
@@ -2195,7 +2379,7 @@ with tabs[2]:
                         or init_bytes_generated
                         or skybox_display
                     )
-                    if location_reuse_enabled and location_present and location_key:
+                    if reuse_location_cache and location_reuse_enabled and location_present and location_key:
                         update_location_cache(
                             skybox_cache,
                             location_key,
