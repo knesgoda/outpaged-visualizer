@@ -54,7 +54,6 @@ ANTI_LETTERBOX_TOKENS = [
 
 SKYBOX_PROMPT_WRAPPER_TOKENS = [
     "full 360° equirectangular panorama (2:1)",
-    "camera at human eye level (1.6m), centered in room",
     "detailed zenith (ceiling) and nadir (floor)",
     "no smeared/blurred poles",
     "no vignetting",
@@ -64,25 +63,106 @@ SKYBOX_INIT_DETAIL_TOKENS = [
     "detailed ceiling beams/plaster texture at zenith",
     "detailed floorboards/rug texture at nadir",
 ]
-SKYBOX_ENVIRONMENT_PREFIX = (
-    "empty environment, architecture only, no characters, no mascots, no toys, no dolls, "
-    "no stuffed animals, no props, no staged objects, no foreground subject, "
+SKYBOX_INIT_WRAPPER_TOKENS = [
+    "skybox init plate",
+    "evenly distributed detail",
+    "no close foreground occluders",
+]
+
+STYLE_PACKS = {
+    "default": "3D watercolor, warm natural light, storybook realism",
+    "wizard_of_oz": "storybook watercolor and ink, slightly magical realism",
+    "gullivers_travels": "vivid chalk pastel illustration, deep 3D chalk texture",
+    "jekyll_hyde": "gritty photorealistic Victorian, moody fog, gaslight",
+}
+
+EMPTY_ENVIRONMENT_GUARDRAILS = (
+    "empty environment, empty room, environment only, no characters present, "
+    "no creatures, no toys, no plush, no figurines, no stuffed animals, "
+    "no teddy bear, no dolls, no storybook characters"
 )
-SKYBOX_INIT_WRAPPER_PREFIX = (
-    "empty architectural interior or landscape, wide environment plate, level camera, "
-    "horizon centered, no props, no toys, no foreground subject, evenly distributed detail, "
+
+NEGATIVE_INTERIOR = (
+    "people, person, faces, bodies, hands, crowds, animals, pets, anthropomorphic animals, "
+    "plush toys, teddy bears, dolls, cartoon characters, mascots, character costumes, "
+    "text, letters, signage, watermark, logo, UI, modern electronics, cameras, camera rigs, "
+    "microphones, tripods, screens, TVs, laptops, phones, wires, outlets, modern vehicles, "
+    "anachronistic items, sci-fi, plastic, neon, LED, blurry, low-res, artifacts"
 )
-SKYBOX_INIT_WRAPPER_SUFFIX = (
-    ", watercolor diorama look, soft natural light, no people, no animals, "
-    "no characters, no text, no logos"
+NEGATIVE_EXTERIOR = (
+    "people, person, faces, bodies, hands, crowds, animals, pets, anthropomorphic animals, "
+    "plush toys, teddy bears, dolls, cartoon characters, mascots, character costumes, "
+    "text, letters, signage, watermark, logo, UI, modern electronics, cameras, camera rigs, "
+    "microphones, tripods, screens, TVs, laptops, phones, wires, outlets, modern vehicles, "
+    "anachronistic items, sci-fi, plastic, neon, LED, blurry, low-res, artifacts"
 )
-SKYBOX_HARD_NEGATIVE_DEFAULT = (
-    "people, person, face, humanoid, character, mascot, cartoon, "
-    "toy, doll, plush, stuffed animal, teddy bear, figurine, puppet, "
-    "camera, film camera, tripod, lens, projector, studio equipment, microphone, "
-    "phone, smartphone, computer, television, electronics, wires, cables, UI, "
-    "text, letters, signage, watermark, logo"
-)
+
+SKYBOX_HARD_NEGATIVE_DEFAULT = ""
+
+class PromptPolicy:
+    def __init__(
+        self,
+        style_pack: str = "default",
+        era_locale_tags: str | None = None,
+    ) -> None:
+        self.style_pack = style_pack if style_pack in STYLE_PACKS else "default"
+        self.era_locale_tags = era_locale_tags.strip() if era_locale_tags else ""
+
+    def base_prefix(self, environment_type: str, output_type: str) -> str:
+        env = environment_type.lower()
+        output = output_type.lower()
+        if output == "skybox":
+            if env == "exterior":
+                return (
+                    "full 360° equirectangular panorama (2:1), ground view, eye level, "
+                    "wide panoramic environment plate, horizon stable, evenly distributed detail, "
+                    "no close foreground occluders"
+                )
+            return (
+                "full 360° equirectangular panorama (2:1), ground view, eye level, "
+                "wide-angle interior environment plate, camera centered in the room, "
+                "continuous walls and ceiling, natural perspective, soft depth, "
+                "no close foreground occluders"
+            )
+        if output == "background":
+            return (
+                "cinematic wide establishing shot, strong depth, "
+                "clear foreground/midground/background separation, environment only"
+            )
+        return ""
+
+    def style_suffix(self) -> str:
+        return STYLE_PACKS.get(self.style_pack, STYLE_PACKS["default"])
+
+    def negative_prompt(self, environment_type: str) -> str:
+        env = environment_type.lower()
+        return NEGATIVE_EXTERIOR if env == "exterior" else NEGATIVE_INTERIOR
+
+    def build_prompt(
+        self,
+        scene_text: str,
+        environment_type: str,
+        output_type: str,
+    ) -> str:
+        parts = [
+            self.base_prefix(environment_type, output_type),
+            scene_text,
+            self.era_locale_tags,
+            EMPTY_ENVIRONMENT_GUARDRAILS,
+            self.style_suffix(),
+        ]
+        cleaned = ", ".join(part for part in parts if part)
+        cleaned = re.sub(r"\s*,\s*", ", ", cleaned).strip(" ,")
+        return cleaned
+
+    def build_skybox_init_prompt(
+        self,
+        scene_text: str,
+        environment_type: str,
+    ) -> str:
+        base_prompt = self.build_prompt(scene_text, environment_type, "skybox")
+        tokens = SKYBOX_INIT_WRAPPER_TOKENS + SKYBOX_INIT_DETAIL_TOKENS
+        return _append_prompt_tokens(base_prompt, tokens)
 
 with st.sidebar:
     st.header("Output options")
@@ -108,8 +188,32 @@ with st.sidebar:
         key="panoramic_style",
     )
     panoramic_style = PADDING_STYLE_OPTIONS[panoramic_style_label]
+    st.header("Prompt policy")
+    style_pack_label = st.selectbox(
+        "Style pack",
+        list(STYLE_PACKS.keys()),
+        index=0,
+        key="prompt_style_pack",
+    )
+    era_locale_tags = st.text_input(
+        "Era/locale tags (optional)",
+        value="",
+        key="prompt_era_locale_tags",
+    )
+    environment_type_label = st.selectbox(
+        "Environment type",
+        ["Auto", "Interior", "Exterior"],
+        index=0,
+        key="prompt_environment_type",
+    )
 
     st.header("Reuse options")
+    cache_mode_label = st.selectbox(
+        "Cache mode",
+        ["OFF", "APPROVAL ONLY", "ALWAYS"],
+        index=1,
+        key="cache_mode",
+    )
     reuse_location_cache = st.checkbox(
         "Reuse location cache",
         value=True,
@@ -133,6 +237,7 @@ with st.sidebar:
         st.session_state["char_cache"] = {}
         st.session_state["skybox_cache"] = {}
         st.session_state["location_cache"] = {}
+        st.session_state["pending_cache"] = {"background": {}, "skybox": {}}
         st.success("Cleared location cache.")
     st.header("Skybox init scoring")
     avoid_blurred_poles = st.checkbox(
@@ -175,6 +280,8 @@ if "skybox_cache" not in st.session_state:
     st.session_state["skybox_cache"] = {}
 if "location_cache" not in st.session_state:
     st.session_state["location_cache"] = {}
+if "pending_cache" not in st.session_state:
+    st.session_state["pending_cache"] = {"background": {}, "skybox": {}}
 
 def _b64_of_uploaded_file(uploaded_file) -> str:
     data = uploaded_file.getvalue()
@@ -521,11 +628,9 @@ def make_skybox_init_from_stability(
 ) -> tuple[bytes, int | None]:
     if neutralize_possessives:
         scene_prompt = neutralize_character_possessives(scene_prompt)
-    scene_prompt = sanitize_skybox_prompt(scene_prompt)
-    scene_prompt = _apply_skybox_environment_prefix(scene_prompt)
     prompt = _build_skybox_init_prompt(scene_prompt)
 
-    source_aspect = "21:9"
+    source_aspect = "16:9"
 
     best_bytes = None
     best_seed = None
@@ -914,8 +1019,11 @@ def convert_to_panoramic(
             if height == 0 or width == 0:
                 return image_bytes
             current_ratio = width / height
-            if abs(current_ratio - ratio) < 1e-6:
+            if abs(current_ratio - ratio) <= 0.01:
                 return image_bytes
+            if abs(ratio - 2.0) <= 0.01:
+                cropped = _center_crop_to_ratio(image, ratio)
+                return _image_to_png_bytes(cropped)
             padded = pad_to_ratio(image, ratio, padding_style)
             return _image_to_png_bytes(padded)
     except OSError:
@@ -1011,6 +1119,130 @@ def sanitize_skybox_prompt(text: str) -> str:
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned.strip(" ,;-")
 
+def infer_environment_type(text: str, default: str = "interior") -> str:
+    if not text:
+        return default
+    lower = text.lower()
+    interior_keywords = {
+        "interior",
+        "room",
+        "hall",
+        "nursery",
+        "bedroom",
+        "parlor",
+        "study",
+        "lab",
+        "laboratory",
+        "staircase",
+        "cabin",
+        "corridor",
+        "attic",
+        "kitchen",
+        "loft",
+        "foyer",
+        "library",
+        "workshop",
+    }
+    exterior_keywords = {
+        "exterior",
+        "outdoor",
+        "garden",
+        "field",
+        "forest",
+        "meadow",
+        "river",
+        "shore",
+        "street",
+        "village",
+        "countryside",
+        "mountain",
+        "valley",
+        "coast",
+        "farm",
+        "yard",
+        "roof",
+    }
+    if any(word in lower for word in interior_keywords):
+        return "interior"
+    if any(word in lower for word in exterior_keywords):
+        return "exterior"
+    return default
+
+def resolve_environment_type(prompt_text: str, environment_type_label: str) -> str:
+    if environment_type_label.lower() == "interior":
+        return "interior"
+    if environment_type_label.lower() == "exterior":
+        return "exterior"
+    return infer_environment_type(prompt_text, default="interior")
+
+def extract_character_names(char_items: list[dict]) -> list[str]:
+    names: list[str] = []
+    alias_pattern = re.compile(r"\b(?:aka|a\.k\.a\.|also known as|alias)\b", re.IGNORECASE)
+    for item in char_items:
+        filename = item.get("filename", "")
+        prompt = item.get("prompt", "")
+        for candidate in re.split(r"[/,]+", filename):
+            candidate = candidate.strip()
+            if candidate:
+                names.append(candidate)
+        if alias_pattern.search(prompt):
+            parts = alias_pattern.split(prompt)
+            for alias_part in parts[1:]:
+                alias_chunk = re.split(r"[.;]", alias_part, maxsplit=1)[0]
+                for candidate in re.split(r"[/,]+", alias_chunk):
+                    candidate = candidate.strip()
+                    if candidate:
+                        names.append(candidate)
+        match = re.search(r"\b(?:named|called)\s+([A-Z][\w'\-]*(?:\s+[A-Z][\w'\-]*){0,3})", prompt)
+        if match:
+            names.append(match.group(1).strip())
+    deduped = []
+    seen = set()
+    for name in names:
+        key = re.sub(r"\s+", " ", name.strip().lower())
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(name.strip())
+    return deduped
+
+def _build_name_pattern(name: str) -> str:
+    tokens = re.split(r"[\s\-]+", name.strip())
+    tokens = [re.escape(token) for token in tokens if token]
+    if not tokens:
+        return ""
+    return r"\b" + r"(?:[\s\-]+)".join(tokens) + r"\b"
+
+def sanitize_environment_prompt(prompt_text: str, character_name_list: list[str]) -> str:
+    if not prompt_text or not character_name_list:
+        return prompt_text
+    sanitized = prompt_text
+    child_words = {"nursery", "bedroom", "playroom", "room", "staircase"}
+    workplace_words = {"lab", "laboratory", "study", "office", "workshop"}
+    patterns = []
+    for name in sorted(character_name_list, key=len, reverse=True):
+        pattern = _build_name_pattern(name)
+        if pattern:
+            patterns.append(pattern)
+    for pattern in patterns:
+        possessive_regex = re.compile(rf"(?i){pattern}\s*['’]s\b")
+
+        def possessive_replacer(match: re.Match) -> str:
+            remainder = match.string[match.end():]
+            next_word_match = re.search(r"\s+([A-Za-z][\w-]*)", remainder)
+            next_word = next_word_match.group(1).lower() if next_word_match else ""
+            if next_word in child_words:
+                return "child's"
+            if next_word in workplace_words:
+                return "private"
+            return "a"
+
+        sanitized = possessive_regex.sub(possessive_replacer, sanitized)
+        sanitized = re.sub(rf"(?i){pattern}", "", sanitized)
+    sanitized = re.sub(r"\s{2,}", " ", sanitized)
+    sanitized = re.sub(r"\s+,", ",", sanitized)
+    sanitized = re.sub(r",\s*,", ", ", sanitized)
+    return sanitized.strip(" ,;-")
+
 def neutralize_character_possessives(text: str) -> str:
     pattern = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s*['’]s\b")
     workplace_words = {"lab", "laboratory", "study", "office", "workshop"}
@@ -1038,14 +1270,11 @@ def _split_negative_tokens(text: str) -> list[str]:
             tokens.append(token)
     return tokens
 
-def _apply_skybox_environment_prefix(prompt: str) -> str:
-    if not prompt:
-        return SKYBOX_ENVIRONMENT_PREFIX.strip()
-    return f"{SKYBOX_ENVIRONMENT_PREFIX}{prompt}"
-
 def _build_skybox_init_prompt(scene_prompt: str) -> str:
-    base_wrapper = ", ".join(SKYBOX_PROMPT_WRAPPER_TOKENS + SKYBOX_INIT_DETAIL_TOKENS)
-    return f"{SKYBOX_INIT_WRAPPER_PREFIX}{base_wrapper}, {scene_prompt}{SKYBOX_INIT_WRAPPER_SUFFIX}"
+    if not scene_prompt:
+        return ", ".join(SKYBOX_INIT_WRAPPER_TOKENS + SKYBOX_INIT_DETAIL_TOKENS)
+    tokens = SKYBOX_INIT_WRAPPER_TOKENS + SKYBOX_INIT_DETAIL_TOKENS
+    return _append_prompt_tokens(scene_prompt, tokens)
 
 def _merge_negative_prompts(
     user_negative: str,
@@ -1133,6 +1362,15 @@ def update_location_cache(
         "seed": seed,
         "prompt": prompt,
     }
+
+def cache_mode_allows_reuse(cache_mode: str) -> bool:
+    return cache_mode.upper() != "OFF"
+
+def cache_mode_allows_auto_save(cache_mode: str) -> bool:
+    return cache_mode.upper() == "ALWAYS"
+
+def cache_mode_requires_approval(cache_mode: str) -> bool:
+    return cache_mode.upper() == "APPROVAL ONLY"
 
 def _split_prompt_and_negative(text: str) -> tuple[str, str]:
     match = re.search(r"\bnegative prompt\b\s*:?", text, flags=re.IGNORECASE)
@@ -1327,8 +1565,8 @@ with tabs[0]:
         st.info("No background entries parsed yet. Ensure your DOCX includes 'Background file name: <name>'.")
 
     bg_negative = st.text_input(
-        "Negative prompt",
-        "text, watermark, logo, low quality, blurry, letterbox, black bars, borders, frame, vignette frame",
+        "Negative prompt (optional overrides)",
+        "",
         key="background_negative",
     )
     bg_aspect = "21:9"
@@ -1377,7 +1615,21 @@ with tabs[0]:
         if not bg_items:
             st.error("No background prompts parsed. Please check your DOCX or pasted text.")
             st.stop()
+        prompt_policy = PromptPolicy(style_pack_label, era_locale_tags)
+        character_names = extract_character_names(
+            parse_prompt_blocks(
+                st.session_state.get("character_text", ""),
+                [
+                    r"character name\s*/\s*file name\s*:\s*(?P<filename>.+)",
+                    r"character file name\s*:\s*(?P<filename>.+)",
+                    r"character filename\s*:\s*(?P<filename>.+)",
+                    r"file name\s*:\s*(?P<filename>.+)",
+                ],
+            )
+        )
         bg_cache = st.session_state["bg_cache"]
+        cache_mode = cache_mode_label
+        reuse_cache_allowed = reuse_location_cache and cache_mode_allows_reuse(cache_mode)
         items_to_run = bg_items[:1] if preview_bg else bg_items
         all_outputs: list[tuple[str, bytes]] = []
         manifest_entries: list[dict] = []
@@ -1386,16 +1638,20 @@ with tabs[0]:
             try:
                 for idx, item in enumerate(items_to_run):
                     seed = build_seed(bg_seed, idx)
+                    env_type = resolve_environment_type(item.get("prompt", ""), environment_type_label)
+                    policy_negative_tokens = _split_negative_tokens(
+                        prompt_policy.negative_prompt(env_type)
+                    )
                     negative_prompt = _merge_negative_prompts(
                         bg_negative,
                         item.get("negative_prompt", ""),
-                        ANTI_LETTERBOX_TOKENS,
+                        ANTI_LETTERBOX_TOKENS + policy_negative_tokens,
                     )
                     location_key = ""
                     cached_entry = None
                     similarity = 0.0
                     location_line_present = bool(item.get("location_line_present"))
-                    if reuse_location_cache and location_reuse_enabled and location_line_present:
+                    if reuse_cache_allowed and location_reuse_enabled and location_line_present:
                         location_key = normalize_location(item.get("location", ""))
                         _, cached_entry, similarity = find_similar_location(
                             location_key,
@@ -1414,7 +1670,7 @@ with tabs[0]:
                     provider_label = "Stability.ai"
                     init_bytes_to_use = init_bytes
                     reused_init = False
-                    if reuse_location_cache and cached_init_bytes and init_bytes_to_use is None:
+                    if reuse_cache_allowed and cached_init_bytes and init_bytes_to_use is None:
                         init_bytes_to_use = cached_init_bytes
                         reused_init = True
                         status.write("Reusing cached reference image for this background.")
@@ -1422,7 +1678,7 @@ with tabs[0]:
                     seed_to_use = seed
                     reused_seed = False
                     if (
-                        reuse_location_cache
+                        reuse_cache_allowed
                         and reuse_cached_seed
                         and base_seed_selected
                         and cached_seed is not None
@@ -1431,7 +1687,11 @@ with tabs[0]:
                         reused_seed = True
                         status.write(f"Reusing cached seed {seed_to_use} for this background.")
                     stability_key = stability_api_key()
-                    prompt_text = _sanitize_prompt_text(item["prompt"])
+                    sanitized_prompt = sanitize_environment_prompt(
+                        item["prompt"], character_names
+                    )
+                    prompt_text = _sanitize_prompt_text(sanitized_prompt)
+                    prompt_text = prompt_policy.build_prompt(prompt_text, env_type, "background")
                     images = stability_generate_images(
                         prompt=prompt_text,
                         negative_prompt=negative_prompt,
@@ -1455,15 +1715,23 @@ with tabs[0]:
                         for image_bytes in images
                     ]
                     if processed_images:
-                        if reuse_location_cache and location_reuse_enabled and location_line_present:
-                            update_location_cache(
-                                bg_cache,
-                                location_key,
-                                item.get("location", ""),
-                                processed_images[0],
-                                seed_used,
-                                prompt_text,
-                            )
+                        if reuse_cache_allowed and location_reuse_enabled and location_line_present:
+                            if cache_mode_allows_auto_save(cache_mode):
+                                update_location_cache(
+                                    bg_cache,
+                                    location_key,
+                                    item.get("location", ""),
+                                    processed_images[0],
+                                    seed_used,
+                                    prompt_text,
+                                )
+                            elif cache_mode_requires_approval(cache_mode):
+                                st.session_state["pending_cache"]["background"][location_key] = {
+                                    "location_label": item.get("location", ""),
+                                    "image_bytes": processed_images[0],
+                                    "seed": seed_used,
+                                    "prompt": prompt_text,
+                                }
                     for image_index, image_bytes in enumerate(processed_images, start=1):
                         if bg_count > 1:
                             filename = f"{item['filename']}_{image_index:02d}.png"
@@ -1490,6 +1758,28 @@ with tabs[0]:
                             caption=f"{filename} • {provider_label}",
                             use_container_width=True,
                         )
+                        if (
+                            cache_mode_requires_approval(cache_mode)
+                            and reuse_cache_allowed
+                            and location_reuse_enabled
+                            and location_line_present
+                            and image_index == 1
+                        ):
+                            approve_key = f"approve_bg_{location_key}_{item['filename']}"
+                            if st.button("Approve as reference", key=approve_key):
+                                pending = st.session_state["pending_cache"]["background"].pop(
+                                    location_key, None
+                                )
+                                if pending:
+                                    update_location_cache(
+                                        bg_cache,
+                                        location_key,
+                                        pending["location_label"],
+                                        pending["image_bytes"],
+                                        pending["seed"],
+                                        pending["prompt"],
+                                    )
+                                    st.success("Reference approved and cached.")
 
                 if all_outputs:
                     zip_bytes = zip_outputs(all_outputs, "backgrounds", manifest_entries)
@@ -1749,6 +2039,28 @@ with tabs[1]:
                                 caption=f"{filename} • {provider_label}",
                                 use_container_width=True,
                             )
+                        if (
+                            cache_mode_requires_approval(cache_mode)
+                            and reuse_cache_allowed
+                            and location_reuse_enabled
+                            and location_line_present
+                            and image_index == 1
+                        ):
+                            approve_key = f"approve_bg_{location_key}_{item['filename']}"
+                            if st.button("Approve as reference", key=approve_key):
+                                pending = st.session_state["pending_cache"]["background"].pop(
+                                    location_key, None
+                                )
+                                if pending:
+                                    update_location_cache(
+                                        bg_cache,
+                                        location_key,
+                                        pending["location_label"],
+                                        pending["image_bytes"],
+                                        pending["seed"],
+                                        pending["prompt"],
+                                    )
+                                    st.success("Reference approved and cached.")
 
                 if all_outputs:
                     zip_bytes = zip_outputs(all_outputs, "characters", manifest_entries)
@@ -1859,7 +2171,7 @@ with tabs[2]:
         )
         negative = st.text_input(
             "Negative text (optional)",
-            "people, text, watermark, letterbox, black bars, borders, frame, vignette frame",
+            "",
             key="skybox_negative",
         )
         skybox_aspect_label = st.selectbox(
@@ -1921,6 +2233,18 @@ with tabs[2]:
             if not skybox_items:
                 st.error("No skybox prompts parsed. Please check your DOCX or pasted text.")
                 st.stop()
+            prompt_policy = PromptPolicy(style_pack_label, era_locale_tags)
+            character_names = extract_character_names(
+                parse_prompt_blocks(
+                    st.session_state.get("character_text", ""),
+                    [
+                        r"character name\s*/\s*file name\s*:\s*(?P<filename>.+)",
+                        r"character file name\s*:\s*(?P<filename>.+)",
+                        r"character filename\s*:\s*(?P<filename>.+)",
+                        r"file name\s*:\s*(?P<filename>.+)",
+                    ],
+                )
+            )
             init_b64 = None
             init_bytes_uploaded = None
             if init_img:
@@ -1932,6 +2256,8 @@ with tabs[2]:
                 init_b64 = base64.b64encode(init_bytes_uploaded).decode("utf-8")
             control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
             skybox_cache = st.session_state["skybox_cache"]
+            cache_mode = cache_mode_label
+            reuse_cache_allowed = reuse_location_cache and cache_mode_allows_reuse(cache_mode)
             items_to_run = skybox_items[:1] if preview_skybox else skybox_items
             all_outputs: list[tuple[str, bytes]] = []
             manifest_entries: list[dict] = []
@@ -1939,17 +2265,18 @@ with tabs[2]:
                 try:
                     for idx, item in enumerate(items_to_run):
                         skybox_seed = build_seed(int(seed), idx)
+                        env_type = resolve_environment_type(item.get("prompt", ""), environment_type_label)
+                        policy_negative_tokens = _split_negative_tokens(
+                            prompt_policy.negative_prompt(env_type)
+                        )
                         negative_text = _merge_negative_prompts(
                             negative,
                             item.get("negative_prompt", ""),
-                            ANTI_LETTERBOX_TOKENS,
+                            ANTI_LETTERBOX_TOKENS + hard_negative_tokens + policy_negative_tokens,
                         )
-                        negative_text = _merge_negative_prompts(
-                            negative_text,
-                            "",
-                            hard_negative_tokens,
+                        raw_prompt_text = sanitize_environment_prompt(
+                            item["prompt"], character_names
                         )
-                        raw_prompt_text = item["prompt"]
                         if neutralize_possessives:
                             raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
                         sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
@@ -1958,7 +2285,11 @@ with tabs[2]:
                             negative_text,
                             minimal_furnishings,
                         )
-                        scene_prompt = _apply_skybox_environment_prefix(sanitized_prompt)
+                        scene_prompt = prompt_policy.build_prompt(
+                            sanitized_prompt,
+                            env_type,
+                            "skybox",
+                        )
                         blockade_prompt = (
                             _apply_skybox_wrapper(scene_prompt) if apply_skybox_wrapper else scene_prompt
                         )
@@ -1966,7 +2297,7 @@ with tabs[2]:
                         cached_entry = None
                         similarity = 0.0
                         location_line_present = bool(item.get("location_line_present"))
-                        if reuse_location_cache and location_reuse_enabled and location_line_present:
+                        if reuse_cache_allowed and location_reuse_enabled and location_line_present:
                             location_key = normalize_location(item.get("location", ""))
                             _, cached_entry, similarity = find_similar_location(
                                 location_key,
@@ -1985,16 +2316,19 @@ with tabs[2]:
                         init_bytes_generated = None
                         init_b64_to_use = init_b64
                         reused_init = False
-                        init_scene_prompt = _apply_skybox_environment_prefix(sanitized_prompt)
-                        init_prompt_debug = _build_skybox_init_prompt(init_scene_prompt)
-                        if reuse_location_cache and cached_init_bytes and init_b64_to_use is None:
+                        init_scene_prompt = scene_prompt
+                        init_prompt_debug = prompt_policy.build_skybox_init_prompt(
+                            sanitized_prompt,
+                            env_type,
+                        )
+                        if reuse_cache_allowed and cached_init_bytes and init_b64_to_use is None:
                             init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
                             reused_init = True
                             status.write("Reusing cached INIT image for this skybox.")
                         if init_b64_to_use is None:
                             stability_key = stability_api_key()
                             init_bytes, init_seed_used = make_skybox_init_from_stability(
-                                scene_prompt=sanitized_prompt,
+                                scene_prompt=init_scene_prompt,
                                 negative_prompt=negative_text,
                                 base_seed=skybox_seed,
                                 api_key=stability_key,
@@ -2010,16 +2344,12 @@ with tabs[2]:
                             status.write(f"Stability init negative: {negative_text}")
                             status.write(f"Stability init seed used: {init_seed_used}")
                             status.write(f"Stability init cache reused: {reused_init}")
-                            if reuse_location_cache and location_reuse_enabled and location_line_present:
-                                update_location_cache(
-                                    skybox_cache,
-                                    location_key,
-                                    item.get("location", ""),
-                                    init_bytes,
-                                    init_seed_used,
-                                    blockade_prompt,
-                                )
                             status.write("Generated Stability.ai init plate for Skybox.")
+                            st.image(
+                                init_bytes_generated,
+                                caption=f"{item['filename']} • init plate preview",
+                                use_container_width=True,
+                            )
                         elif reused_init:
                             status.write(f"Stability init prompt (cached): {init_prompt_debug}")
                             status.write(f"Stability init negative (cached): {negative_text}")
@@ -2033,7 +2363,7 @@ with tabs[2]:
                         seed_to_use = skybox_seed
                         reused_seed = False
                         if (
-                            reuse_location_cache
+                            reuse_cache_allowed
                             and reuse_cached_seed
                             and base_seed_selected
                             and cached_seed is not None
@@ -2071,15 +2401,23 @@ with tabs[2]:
                             or init_bytes_generated
                             or skybox_display
                         )
-                        if reuse_location_cache and location_reuse_enabled and location_line_present:
-                            update_location_cache(
-                                skybox_cache,
-                                location_key,
-                                item.get("location", ""),
-                                cache_bytes,
-                                seed_to_use,
-                                blockade_prompt,
-                            )
+                        if reuse_cache_allowed and location_reuse_enabled and location_line_present:
+                            if cache_mode_allows_auto_save(cache_mode):
+                                update_location_cache(
+                                    skybox_cache,
+                                    location_key,
+                                    item.get("location", ""),
+                                    cache_bytes,
+                                    seed_to_use,
+                                    blockade_prompt,
+                                )
+                            elif cache_mode_requires_approval(cache_mode):
+                                st.session_state["pending_cache"]["skybox"][location_key] = {
+                                    "location_label": item.get("location", ""),
+                                    "image_bytes": cache_bytes,
+                                    "seed": seed_to_use,
+                                    "prompt": blockade_prompt,
+                                }
                         filename = f"{item['filename']}.png"
                         all_outputs.append((filename, skybox_display))
                         manifest_entries.append(
@@ -2104,6 +2442,27 @@ with tabs[2]:
                             caption=f"{item['filename']} (equirectangular preview)",
                             use_container_width=True,
                         )
+                        if (
+                            cache_mode_requires_approval(cache_mode)
+                            and reuse_cache_allowed
+                            and location_reuse_enabled
+                            and location_line_present
+                        ):
+                            approve_key = f"approve_skybox_{location_key}_{item['filename']}"
+                            if st.button("Approve as reference", key=approve_key):
+                                pending = st.session_state["pending_cache"]["skybox"].pop(
+                                    location_key, None
+                                )
+                                if pending:
+                                    update_location_cache(
+                                        skybox_cache,
+                                        location_key,
+                                        pending["location_label"],
+                                        pending["image_bytes"],
+                                        pending["seed"],
+                                        pending["prompt"],
+                                    )
+                                    st.success("Reference approved and cached.")
 
                     if all_outputs:
                         zip_bytes = zip_outputs(all_outputs, "skyboxes", manifest_entries)
@@ -2220,6 +2579,18 @@ with tabs[2]:
         gen_btn = st.button("Generate Skybox", type="primary", use_container_width=True, key="skybox_generate")
 
         if gen_btn:
+            prompt_policy = PromptPolicy(style_pack_label, era_locale_tags)
+            character_names = extract_character_names(
+                parse_prompt_blocks(
+                    st.session_state.get("character_text", ""),
+                    [
+                        r"character name\s*/\s*file name\s*:\s*(?P<filename>.+)",
+                        r"character file name\s*:\s*(?P<filename>.+)",
+                        r"character filename\s*:\s*(?P<filename>.+)",
+                        r"file name\s*:\s*(?P<filename>.+)",
+                    ],
+                )
+            )
             init_b64 = None
             init_bytes_uploaded = None
             if init_img:
@@ -2234,17 +2605,16 @@ with tabs[2]:
             prompt_lines = [line.strip() for line in prompt.splitlines() if line.strip()]
             location_line, remaining_lines, location_present = _extract_location_line(prompt_lines)
             prompt_text, prompt_negative = _split_prompt_and_negative(" ".join(remaining_lines).strip())
+            env_type = resolve_environment_type(prompt_text, environment_type_label)
+            policy_negative_tokens = _split_negative_tokens(
+                prompt_policy.negative_prompt(env_type)
+            )
             negative_text = _merge_negative_prompts(
                 negative,
                 prompt_negative,
-                ANTI_LETTERBOX_TOKENS,
+                ANTI_LETTERBOX_TOKENS + hard_negative_tokens + policy_negative_tokens,
             )
-            negative_text = _merge_negative_prompts(
-                negative_text,
-                "",
-                hard_negative_tokens,
-            )
-            raw_prompt_text = prompt_text
+            raw_prompt_text = sanitize_environment_prompt(prompt_text, character_names)
             if neutralize_possessives:
                 raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
             sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
@@ -2253,7 +2623,11 @@ with tabs[2]:
                 negative_text,
                 minimal_furnishings,
             )
-            scene_prompt = _apply_skybox_environment_prefix(sanitized_prompt)
+            scene_prompt = prompt_policy.build_prompt(
+                sanitized_prompt,
+                env_type,
+                "skybox",
+            )
             blockade_prompt = (
                 _apply_skybox_wrapper(scene_prompt) if apply_skybox_wrapper else scene_prompt
             )
@@ -2262,7 +2636,9 @@ with tabs[2]:
             skybox_cache = st.session_state["skybox_cache"]
             cached_entry = None
             similarity = 0.0
-            if reuse_location_cache and location_reuse_enabled and location_present and location_text:
+            cache_mode = cache_mode_label
+            reuse_cache_allowed = reuse_location_cache and cache_mode_allows_reuse(cache_mode)
+            if reuse_cache_allowed and location_reuse_enabled and location_present and location_text:
                 location_key = normalize_location(location_text)
                 _, cached_entry, similarity = find_similar_location(
                     location_key,
@@ -2284,16 +2660,19 @@ with tabs[2]:
                     init_bytes_generated = None
                     init_b64_to_use = init_b64
                     reused_init = False
-                    init_scene_prompt = _apply_skybox_environment_prefix(sanitized_prompt)
-                    init_prompt_debug = _build_skybox_init_prompt(init_scene_prompt)
-                    if reuse_location_cache and cached_init_bytes and init_b64_to_use is None:
+                    init_scene_prompt = scene_prompt
+                    init_prompt_debug = prompt_policy.build_skybox_init_prompt(
+                        sanitized_prompt,
+                        env_type,
+                    )
+                    if reuse_cache_allowed and cached_init_bytes and init_b64_to_use is None:
                         init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
                         reused_init = True
                         status.write("Reusing cached INIT image for this skybox.")
                     if init_b64_to_use is None:
                         stability_key = stability_api_key()
                         init_bytes, init_seed_used = make_skybox_init_from_stability(
-                            scene_prompt=sanitized_prompt,
+                            scene_prompt=init_scene_prompt,
                             negative_prompt=negative_text,
                             base_seed=skybox_seed,
                             api_key=stability_key,
@@ -2309,16 +2688,12 @@ with tabs[2]:
                         status.write(f"Stability init negative: {negative_text}")
                         status.write(f"Stability init seed used: {init_seed_used}")
                         status.write(f"Stability init cache reused: {reused_init}")
-                        if reuse_location_cache and location_reuse_enabled and location_present and location_key:
-                            update_location_cache(
-                                skybox_cache,
-                                location_key,
-                                location_text,
-                                init_bytes,
-                                init_seed_used,
-                                blockade_prompt,
-                            )
                         status.write("Generated Stability.ai init plate for Skybox.")
+                        st.image(
+                            init_bytes_generated,
+                            caption="Skybox init plate preview",
+                            use_container_width=True,
+                        )
                     elif reused_init:
                         status.write(f"Stability init prompt (cached): {init_prompt_debug}")
                         status.write(f"Stability init negative (cached): {negative_text}")
@@ -2332,7 +2707,7 @@ with tabs[2]:
                     seed_to_use = skybox_seed
                     reused_seed = False
                     if (
-                        reuse_location_cache
+                        reuse_cache_allowed
                         and reuse_cached_seed
                         and base_seed_selected
                         and cached_seed is not None
@@ -2379,21 +2754,51 @@ with tabs[2]:
                         or init_bytes_generated
                         or skybox_display
                     )
-                    if reuse_location_cache and location_reuse_enabled and location_present and location_key:
-                        update_location_cache(
-                            skybox_cache,
-                            location_key,
-                            location_text,
-                            cache_bytes,
-                            seed_to_use,
-                            blockade_prompt,
-                        )
+                    if reuse_cache_allowed and location_reuse_enabled and location_present and location_key:
+                        if cache_mode_allows_auto_save(cache_mode):
+                            update_location_cache(
+                                skybox_cache,
+                                location_key,
+                                location_text,
+                                cache_bytes,
+                                seed_to_use,
+                                blockade_prompt,
+                            )
+                        elif cache_mode_requires_approval(cache_mode):
+                            st.session_state["pending_cache"]["skybox"][location_key] = {
+                                "location_label": location_text,
+                                "image_bytes": cache_bytes,
+                                "seed": seed_to_use,
+                                "prompt": blockade_prompt,
+                            }
                     st.download_button(
                         "Download equirectangular (base)",
                         data=skybox_display,
                         file_name="skybox_equirectangular_base.png",
                         mime="image/png",
                     )
+                    if (
+                        cache_mode_requires_approval(cache_mode)
+                        and reuse_cache_allowed
+                        and location_reuse_enabled
+                        and location_present
+                        and location_key
+                    ):
+                        approve_key = f"approve_skybox_single_{location_key}"
+                        if st.button("Approve as reference", key=approve_key):
+                            pending = st.session_state["pending_cache"]["skybox"].pop(
+                                location_key, None
+                            )
+                            if pending:
+                                update_location_cache(
+                                    skybox_cache,
+                                    location_key,
+                                    pending["location_label"],
+                                    pending["image_bytes"],
+                                    pending["seed"],
+                                    pending["prompt"],
+                                )
+                                st.success("Reference approved and cached.")
     
                     if exports_enabled:
                         if export_png_type_id is None or export_cubemap_type_id is None or resolution_id is None:
