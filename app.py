@@ -18,6 +18,9 @@ BLOCKADE_BASE = "https://backend.blockadelabs.com/api/v1"
 STABILITY_CORE_URL = "https://api.stability.ai/v2beta/stable-image/generate/core"
 STABILITY_ULTRA_URL = "https://api.stability.ai/v2beta/stable-image/generate/ultra"
 STABILITY_MAX_UPLOAD_BYTES = 9 * 1024 * 1024
+POLE_DETAIL_STRIP_RATIO = 0.10
+POLE_DETAIL_WEIGHT_DEFAULT = 1.0
+POLE_DETAIL_EPS = 1e-6
 
 st.set_page_config(page_title="OutPaged Visualizer", layout="wide")
 st.title("OutPaged Visualizer")
@@ -47,6 +50,19 @@ ANTI_LETTERBOX_TOKENS = [
     "frame",
     "border",
     "vignette",
+]
+
+SKYBOX_PROMPT_WRAPPER_TOKENS = [
+    "full 360° equirectangular panorama (2:1)",
+    "camera at human eye level (1.6m), centered in room",
+    "detailed zenith (ceiling) and nadir (floor)",
+    "no smeared/blurred poles",
+    "no vignetting",
+    "no extreme wide-angle distortion, no fisheye",
+]
+SKYBOX_INIT_DETAIL_TOKENS = [
+    "detailed ceiling beams/plaster texture at zenith",
+    "detailed floorboards/rug texture at nadir",
 ]
 
 with st.sidebar:
@@ -86,6 +102,21 @@ with st.sidebar:
         value=False,
         help="Allow cached seeds to override manual seed offsets.",
         key="reuse_cached_seed",
+    )
+    st.header("Skybox init scoring")
+    avoid_blurred_poles = st.checkbox(
+        "Avoid blurred skybox poles (prefer ceiling/floor detail)",
+        value=True,
+        key="skybox_avoid_blurred_poles",
+    )
+    pole_detail_weight = st.slider(
+        "Pole detail weight",
+        min_value=0.0,
+        max_value=3.0,
+        value=POLE_DETAIL_WEIGHT_DEFAULT,
+        step=0.1,
+        disabled=not avoid_blurred_poles,
+        key="skybox_pole_detail_weight",
     )
 
 if "bg_cache" not in st.session_state:
@@ -434,6 +465,8 @@ def make_skybox_init_from_stability(
     api_key: str,
     candidates: int = 3,
     make_tileable: bool = True,
+    avoid_blurred_poles: bool = True,
+    pole_detail_weight: float = POLE_DETAIL_WEIGHT_DEFAULT,
 ) -> tuple[bytes, int | None]:
     indoor_keywords = [
         "indoors",
@@ -446,10 +479,11 @@ def make_skybox_init_from_stability(
     ]
     scene_lower = scene_prompt.lower()
     is_indoor = any(keyword in scene_lower for keyword in indoor_keywords)
+    base_wrapper = ", ".join(SKYBOX_PROMPT_WRAPPER_TOKENS + SKYBOX_INIT_DETAIL_TOKENS)
     if is_indoor:
         wrapper_prefix = (
             "interior equirectangular environment plate, centered vanishing point, "
-            "open space at left and right edges, no close foreground, wide angle but not fisheye, "
+            "open space at left and right edges, no close foreground, "
         )
     else:
         wrapper_prefix = (
@@ -457,7 +491,7 @@ def make_skybox_init_from_stability(
             "no close foreground, evenly distributed detail, "
         )
     wrapper_suffix = " no people, no text"
-    prompt = f"{wrapper_prefix}{scene_prompt},{wrapper_suffix}"
+    prompt = f"{wrapper_prefix}{base_wrapper}, {scene_prompt},{wrapper_suffix}"
 
     source_aspect = "21:9"
 
@@ -467,7 +501,8 @@ def make_skybox_init_from_stability(
 
     seed0 = None if (base_seed is None or base_seed <= 0) else int(base_seed)
 
-    for i in range(candidates):
+    candidate_count = max(candidates, 5) if avoid_blurred_poles else candidates
+    for i in range(candidate_count):
         seed_i = None if seed0 is None else seed0 + i
         raw = stability_generate_ultra(
             prompt=prompt,
@@ -481,7 +516,11 @@ def make_skybox_init_from_stability(
             target_size=(2048, 1024),
             make_tileable=False,
         )
-        score = edge_seam_score(cropped)
+        seam_score = edge_seam_score(cropped)
+        pole_score = pole_detail_score(cropped) if avoid_blurred_poles else 0.0
+        combined_score = seam_score
+        if avoid_blurred_poles:
+            combined_score = seam_score + (pole_detail_weight / (pole_score + POLE_DETAIL_EPS))
         fixed = cropped
         if make_tileable:
             fixed = prepare_skybox_ready_bytes(
@@ -490,8 +529,8 @@ def make_skybox_init_from_stability(
                 make_tileable=True,
             )
 
-        if best_score is None or score < best_score:
-            best_score = score
+        if best_score is None or combined_score < best_score:
+            best_score = combined_score
             best_bytes = fixed
             best_seed = seed_i
 
@@ -635,6 +674,29 @@ def edge_seam_score(image_bytes: bytes) -> float:
         left = arr[:, :strip, :]
         right = arr[:, -strip:, :]
         return float(((left - right) ** 2).mean())
+
+def pole_detail_score(image_bytes: bytes) -> float:
+    """
+    Higher is better. Measures texture/detail in the top and bottom bands.
+    """
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image = image.convert("RGB")
+    except OSError:
+        return 0.0
+    arr = np.array(image).astype("float32")
+    if arr.ndim != 3 or arr.shape[0] == 0:
+        return 0.0
+    height = arr.shape[0]
+    strip = max(1, int(round(height * POLE_DETAIL_STRIP_RATIO)))
+    if strip < 2 or arr.shape[1] < 2:
+        return 0.0
+    lum = 0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1] + 0.0722 * arr[:, :, 2]
+    top = lum[:strip, :]
+    bottom = lum[-strip:, :]
+    top_detail = np.abs(np.diff(top, axis=0)).mean() + np.abs(np.diff(top, axis=1)).mean()
+    bottom_detail = np.abs(np.diff(bottom, axis=0)).mean() + np.abs(np.diff(bottom, axis=1)).mean()
+    return float((top_detail + bottom_detail) / 2.0)
 
 def _build_blurred_background(
     image: Image.Image,
@@ -793,6 +855,18 @@ def _apply_panoramic_conversion(
     mode: str,
     padding_style: str,
 ) -> bytes:
+    if not enabled:
+        return image_bytes
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+    except OSError:
+        return image_bytes
+    if height == 0 or width == 0:
+        return image_bytes
+    current_ratio = width / height
+    if abs(current_ratio - 2.0) <= 0.01:
+        return image_bytes
     return postprocess_to_2to1(image_bytes, enabled, mode, padding_style)
 
 def convert_to_panoramic(
@@ -849,6 +923,12 @@ def _sanitize_prompt_text(text: str) -> str:
         r"\bstreetview,\s*viewer standing at the\b",
         "",
         text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bground view(?:\s+center\s+eye\s+level)?\b",
+        "camera at human eye level (about 1.6m), centered in the room",
+        cleaned,
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(
@@ -1040,6 +1120,12 @@ def _append_prompt_tokens(prompt: str, tokens: list[str]) -> str:
     if not additions:
         return prompt
     return f"{prompt}, {', '.join(additions)}"
+
+def _apply_skybox_wrapper(prompt: str, include_detail: bool = False) -> str:
+    tokens = SKYBOX_PROMPT_WRAPPER_TOKENS[:]
+    if include_detail:
+        tokens.extend(SKYBOX_INIT_DETAIL_TOKENS)
+    return _append_prompt_tokens(prompt, tokens)
 
 def _remove_negative_tokens(negative_text: str, tokens_to_remove: list[str]) -> str:
     if not negative_text:
@@ -1650,9 +1736,16 @@ with tabs[2]:
             help="Add minimal furnishings guidance and keep 'no clutter' in negatives.",
             key="skybox_minimal_furnishings",
         )
+        apply_skybox_wrapper = st.checkbox(
+            "Apply skybox prompt wrapper",
+            value=True,
+            help="Adds panoramic camera guidance (equirectangular 2:1, centered camera, crisp poles).",
+            key="skybox_apply_wrapper",
+        )
         negative = st.text_input(
             "Negative text (optional)",
-            "people, text, watermark, letterbox, black bars, borders, frame, vignette frame",
+            "people, text, watermark, letterbox, black bars, borders, frame, vignette frame, "
+            "teddy bear, stuffed animal, plush toy, doll, toy, cartoon character",
             key="skybox_negative",
         )
         skybox_aspect_label = st.selectbox(
@@ -1742,6 +1835,9 @@ with tabs[2]:
                             negative_text,
                             minimal_furnishings,
                         )
+                        blockade_prompt = (
+                            _apply_skybox_wrapper(prompt_text) if apply_skybox_wrapper else prompt_text
+                        )
                         location_key = ""
                         cached_entry = None
                         similarity = 0.0
@@ -1778,6 +1874,8 @@ with tabs[2]:
                                 api_key=stability_key,
                                 candidates=3,
                                 make_tileable=skybox_tileable_blend,
+                                avoid_blurred_poles=avoid_blurred_poles,
+                                pole_detail_weight=pole_detail_weight,
                             )
                             init_bytes_generated = init_bytes
                             init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
@@ -1788,7 +1886,7 @@ with tabs[2]:
                                     item.get("location", ""),
                                     init_bytes,
                                     init_seed_used,
-                                    prompt_text,
+                                    blockade_prompt,
                                 )
                             status.write("Generated Stability.ai init plate for Skybox.")
                         base_seed_selected = seed > 0
@@ -1799,7 +1897,7 @@ with tabs[2]:
                             reused_seed = True
                             status.write(f"Reusing cached seed {seed_to_use} for this skybox.")
                         gen = blockade_generate_skybox(
-                            prompt=prompt_text,
+                            prompt=blockade_prompt,
                             style_id=style_id,
                             negative_text=negative_text,
                             seed=seed_to_use,
@@ -1831,7 +1929,7 @@ with tabs[2]:
                                 item.get("location", ""),
                                 cache_bytes,
                                 seed_to_use,
-                                prompt_text,
+                                blockade_prompt,
                             )
                         filename = f"{item['filename']}.png"
                         all_outputs.append((filename, skybox_display))
@@ -1839,7 +1937,7 @@ with tabs[2]:
                             {
                                 "filename": filename,
                                 "provider": "Blockade Labs",
-                                "prompt": prompt_text,
+                                "prompt": blockade_prompt,
                                 "negative_prompt": negative_text,
                                 "seed_used": seed_to_use,
                                 "aspect_ratio": _aspect_ratio_from_bytes(skybox_display),
@@ -1997,6 +2095,9 @@ with tabs[2]:
                 negative_text,
                 minimal_furnishings,
             )
+            blockade_prompt = (
+                _apply_skybox_wrapper(prompt_text) if apply_skybox_wrapper else prompt_text
+            )
             location_text = _resolve_location(location_line)
             location_key = ""
             skybox_cache = st.session_state["skybox_cache"]
@@ -2037,6 +2138,8 @@ with tabs[2]:
                             api_key=stability_key,
                             candidates=3,
                             make_tileable=skybox_tileable_blend,
+                            avoid_blurred_poles=avoid_blurred_poles,
+                            pole_detail_weight=pole_detail_weight,
                         )
                         init_bytes_generated = init_bytes
                         init_b64_to_use = base64.b64encode(init_bytes).decode("utf-8")
@@ -2047,7 +2150,7 @@ with tabs[2]:
                                 location_text,
                                 init_bytes,
                                 init_seed_used,
-                                prompt_text,
+                                blockade_prompt,
                             )
                         status.write("Generated Stability.ai init plate for Skybox.")
                     base_seed_selected = seed > 0
@@ -2058,7 +2161,7 @@ with tabs[2]:
                         reused_seed = True
                         status.write(f"Reusing cached seed {seed_to_use} for this skybox.")
                     gen = blockade_generate_skybox(
-                        prompt=prompt_text,
+                        prompt=blockade_prompt,
                         style_id=style_id,
                         negative_text=negative_text,
                         seed=seed_to_use,
@@ -2099,7 +2202,7 @@ with tabs[2]:
                             location_text,
                             cache_bytes,
                             seed_to_use,
-                            prompt_text,
+                            blockade_prompt,
                         )
                     st.download_button(
                         "Download equirectangular (base)",
