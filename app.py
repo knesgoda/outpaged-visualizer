@@ -76,28 +76,105 @@ STYLE_PACKS = {
     "jekyll_hyde": "gritty photorealistic Victorian, moody fog, gaslight",
 }
 
+PROP_PROFILE_OPTIONS = ["AUTO", "EMPTY", "SPARSE", "LIVED_IN"]
+
 EMPTY_ENVIRONMENT_GUARDRAILS = (
-    "empty environment, empty room, environment only, no characters present, "
-    "no creatures, no toys, no plush, no figurines, no stuffed animals, "
-    "no teddy bear, no dolls, no storybook characters"
+    "environment only, no characters present, no living creatures, no storybook characters"
 )
 
-NEGATIVE_INTERIOR = (
-    "people, person, faces, bodies, hands, crowds, animals, pets, anthropomorphic animals, "
-    "plush toys, teddy bears, dolls, cartoon characters, mascots, character costumes, "
-    "text, letters, signage, watermark, logo, UI, modern electronics, cameras, camera rigs, "
-    "microphones, tripods, screens, TVs, laptops, phones, wires, outlets, modern vehicles, "
-    "anachronistic items, sci-fi, plastic, neon, LED, blurry, low-res, artifacts"
+ALWAYS_NEGATIVE = """
+people, person, faces, bodies, hands, crowds, silhouettes, distant figures, tiny people,
+text, letters, typography, signage, watermark, logo, UI,
+modern electronics, screens, TV, laptop, phone, cables, wires,
+cameras, photography equipment, camera rigs, tripods, microphones, film gear,
+vehicles, cars, planes, boats,
+blurry, low-res, jpeg artifacts, deformed, distorted, oversaturated, uncanny
+""".strip()
+
+LIVING_CREATURES_NEGATIVE = "living animals, pets, wildlife, insects, birds, fish"
+
+CHARACTER_NEGATIVE = (
+    "characters, mascots, cartoon characters, costumed characters, anthropomorphic creatures"
 )
-NEGATIVE_EXTERIOR = (
-    "people, person, faces, bodies, hands, crowds, animals, pets, anthropomorphic animals, "
-    "plush toys, teddy bears, dolls, cartoon characters, mascots, character costumes, "
-    "text, letters, signage, watermark, logo, UI, modern electronics, cameras, camera rigs, "
-    "microphones, tripods, screens, TVs, laptops, phones, wires, outlets, modern vehicles, "
-    "anachronistic items, sci-fi, plastic, neon, LED, blurry, low-res, artifacts"
-)
+
+TOYS_NEGATIVE = "plush toys, teddy bears, dolls, figurines, action figures"
+
+EMPTY_PROPS_NEGATIVE = "furniture, clutter, props, decorations, books, toys, rugs, curtains, plants"
+
+NEGATIVE_INTERIOR = "anachronistic items, sci-fi, plastic, neon, LED"
+NEGATIVE_EXTERIOR = "anachronistic items, sci-fi, plastic, neon, LED"
 
 SKYBOX_HARD_NEGATIVE_DEFAULT = ""
+
+def detect_prop_profile(prompt_text: str) -> str:
+    if not prompt_text:
+        return "SPARSE"
+    text = prompt_text.lower()
+    empty_keywords = ("empty", "abandoned", "deserted", "ruined", "dusty", "cobweb", "vacant")
+    lived_in_keywords = ("bedroom", "nursery", "kitchen", "study", "library", "parlor", "living room")
+    sparse_keywords = ("hallway", "staircase", "entryway", "corridor")
+    cozy_keywords = ("cozy", "lived-in")
+    if any(keyword in text for keyword in empty_keywords):
+        return "EMPTY"
+    if any(keyword in text for keyword in lived_in_keywords):
+        return "LIVED_IN"
+    if any(keyword in text for keyword in sparse_keywords):
+        if any(keyword in text for keyword in cozy_keywords):
+            return "LIVED_IN"
+        return "SPARSE"
+    return "SPARSE"
+
+def resolve_prop_profile(prompt_text: str, prop_profile: str) -> str:
+    profile = (prop_profile or "AUTO").upper()
+    if profile == "AUTO":
+        return detect_prop_profile(prompt_text)
+    if profile in {"EMPTY", "SPARSE", "LIVED_IN"}:
+        return profile
+    return "SPARSE"
+
+def build_negative(env_type: str, prop_profile: str, allow_inanimate_toys: bool) -> str:
+    env = env_type.lower()
+    parts = [
+        ALWAYS_NEGATIVE,
+        LIVING_CREATURES_NEGATIVE,
+        CHARACTER_NEGATIVE,
+    ]
+    if not allow_inanimate_toys:
+        parts.append(TOYS_NEGATIVE)
+    if prop_profile == "EMPTY":
+        parts.append(EMPTY_PROPS_NEGATIVE)
+    if env == "exterior":
+        parts.append(NEGATIVE_EXTERIOR)
+    else:
+        parts.append(NEGATIVE_INTERIOR)
+    return ", ".join(part for part in parts if part)
+
+def build_prop_guidance(env_type: str, prop_profile: str, allow_inanimate_toys: bool) -> str:
+    env = env_type.lower()
+    if prop_profile == "EMPTY":
+        guidance = (
+            "empty space, minimal set dressing, dusty corners, faint cobwebs, no furniture"
+            if env != "exterior"
+            else "no manmade clutter, no props, only natural terrain"
+        )
+    elif prop_profile == "LIVED_IN":
+        guidance = (
+            "lived-in and cozy, era-appropriate furniture, a few personal objects"
+            if env != "exterior"
+            else "period-appropriate set dressing only if implied (fences, carts), otherwise natural"
+        )
+        if allow_inanimate_toys and env != "exterior":
+            guidance = (
+                f"{guidance}, a few simple inanimate toys (wooden blocks, toy train) "
+                "as background props, not characters"
+            )
+    else:
+        guidance = (
+            "sparse set dressing, a few era-appropriate objects only, uncluttered"
+            if env != "exterior"
+            else "clean natural scene, minimal objects, no manmade clutter"
+        )
+    return guidance
 
 class PromptPolicy:
     def __init__(
@@ -134,19 +211,35 @@ class PromptPolicy:
     def style_suffix(self) -> str:
         return STYLE_PACKS.get(self.style_pack, STYLE_PACKS["default"])
 
-    def negative_prompt(self, environment_type: str) -> str:
-        env = environment_type.lower()
-        return NEGATIVE_EXTERIOR if env == "exterior" else NEGATIVE_INTERIOR
+    def negative_prompt(
+        self,
+        environment_type: str,
+        prompt_text: str,
+        prop_profile: str,
+        allow_inanimate_toys: bool,
+    ) -> str:
+        resolved_profile = resolve_prop_profile(prompt_text, prop_profile)
+        return build_negative(environment_type, resolved_profile, allow_inanimate_toys)
 
     def build_prompt(
         self,
         scene_text: str,
         environment_type: str,
         output_type: str,
+        prop_profile: str,
+        allow_inanimate_toys: bool,
     ) -> str:
+        resolved_profile = resolve_prop_profile(scene_text, prop_profile)
+        prop_guidance = build_prop_guidance(
+            environment_type,
+            resolved_profile,
+            allow_inanimate_toys,
+        )
+        prop_guidance_text = f"Prop guidance: {prop_guidance}."
         parts = [
             self.base_prefix(environment_type, output_type),
             scene_text,
+            prop_guidance_text,
             self.era_locale_tags,
             EMPTY_ENVIRONMENT_GUARDRAILS,
             self.style_suffix(),
@@ -159,8 +252,16 @@ class PromptPolicy:
         self,
         scene_text: str,
         environment_type: str,
+        prop_profile: str,
+        allow_inanimate_toys: bool,
     ) -> str:
-        base_prompt = self.build_prompt(scene_text, environment_type, "skybox")
+        base_prompt = self.build_prompt(
+            scene_text,
+            environment_type,
+            "skybox",
+            prop_profile,
+            allow_inanimate_toys,
+        )
         tokens = SKYBOX_INIT_WRAPPER_TOKENS + SKYBOX_INIT_DETAIL_TOKENS
         return _append_prompt_tokens(base_prompt, tokens)
 
@@ -205,6 +306,17 @@ with st.sidebar:
         ["Auto", "Interior", "Exterior"],
         index=0,
         key="prompt_environment_type",
+    )
+    prop_profile_setting = st.selectbox(
+        "Prop profile",
+        PROP_PROFILE_OPTIONS,
+        index=0,
+        key="prompt_prop_profile",
+    )
+    allow_inanimate_toys = st.checkbox(
+        "Allow inanimate toys (blocks/train) for bedrooms/nurseries",
+        value=False,
+        key="prompt_allow_inanimate_toys",
     )
 
     st.header("Reuse options")
@@ -1738,14 +1850,6 @@ with tabs[0]:
                 for idx, item in enumerate(items_to_run):
                     seed = build_seed(bg_seed, idx)
                     env_type = resolve_environment_type(item.get("prompt", ""), environment_type_label)
-                    policy_negative_tokens = _split_negative_tokens(
-                        prompt_policy.negative_prompt(env_type)
-                    )
-                    negative_prompt = _merge_negative_prompts(
-                        bg_negative,
-                        item.get("negative_prompt", ""),
-                        ANTI_LETTERBOX_TOKENS + policy_negative_tokens,
-                    )
                     location_key = ""
                     cached_entry = None
                     similarity = 0.0
@@ -1790,7 +1894,29 @@ with tabs[0]:
                         item["prompt"], character_names
                     )
                     prompt_text = _sanitize_prompt_text(sanitized_prompt)
-                    prompt_text = prompt_policy.build_prompt(prompt_text, env_type, "background")
+                    resolved_prop_profile = resolve_prop_profile(prompt_text, prop_profile_setting)
+                    if prop_profile_setting == "AUTO":
+                        status.write(f"Prop profile resolved (AUTO): {resolved_prop_profile}")
+                    policy_negative_tokens = _split_negative_tokens(
+                        prompt_policy.negative_prompt(
+                            env_type,
+                            prompt_text,
+                            prop_profile_setting,
+                            allow_inanimate_toys,
+                        )
+                    )
+                    negative_prompt = _merge_negative_prompts(
+                        bg_negative,
+                        item.get("negative_prompt", ""),
+                        ANTI_LETTERBOX_TOKENS + policy_negative_tokens,
+                    )
+                    prompt_text = prompt_policy.build_prompt(
+                        prompt_text,
+                        env_type,
+                        "background",
+                        prop_profile_setting,
+                        allow_inanimate_toys,
+                    )
                     images = stability_generate_images(
                         prompt=prompt_text,
                         negative_prompt=negative_prompt,
@@ -2246,7 +2372,7 @@ with tabs[2]:
 
         hard_negative_tokens = _split_negative_tokens(skybox_hard_negative_text)
         if skybox_exclude_animals:
-            hard_negative_tokens.extend(["animals", "birds", "insects"])
+            hard_negative_tokens.extend(_split_negative_tokens(LIVING_CREATURES_NEGATIVE))
 
         st.markdown("**Single prompt**")
         prompt = st.text_area(
@@ -2365,20 +2491,31 @@ with tabs[2]:
                     for idx, item in enumerate(items_to_run):
                         skybox_seed = build_seed(int(seed), idx)
                         env_type = resolve_environment_type(item.get("prompt", ""), environment_type_label)
-                        policy_negative_tokens = _split_negative_tokens(
-                            prompt_policy.negative_prompt(env_type)
-                        )
-                        negative_text = _merge_negative_prompts(
-                            negative,
-                            item.get("negative_prompt", ""),
-                            ANTI_LETTERBOX_TOKENS + hard_negative_tokens + policy_negative_tokens,
-                        )
                         raw_prompt_text = sanitize_environment_prompt(
                             item["prompt"], character_names
                         )
                         if neutralize_possessives:
                             raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
                         sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
+                        resolved_prop_profile = resolve_prop_profile(
+                            sanitized_prompt,
+                            prop_profile_setting,
+                        )
+                        if prop_profile_setting == "AUTO":
+                            status.write(f"Prop profile resolved (AUTO): {resolved_prop_profile}")
+                        policy_negative_tokens = _split_negative_tokens(
+                            prompt_policy.negative_prompt(
+                                env_type,
+                                sanitized_prompt,
+                                prop_profile_setting,
+                                allow_inanimate_toys,
+                            )
+                        )
+                        negative_text = _merge_negative_prompts(
+                            negative,
+                            item.get("negative_prompt", ""),
+                            ANTI_LETTERBOX_TOKENS + hard_negative_tokens + policy_negative_tokens,
+                        )
                         (
                             sanitized_prompt,
                             negative_text,
@@ -2395,6 +2532,8 @@ with tabs[2]:
                             sanitized_prompt,
                             env_type,
                             "skybox",
+                            prop_profile_setting,
+                            allow_inanimate_toys,
                         )
                         blockade_prompt = (
                             _apply_skybox_wrapper(scene_prompt) if apply_skybox_wrapper else scene_prompt
@@ -2426,10 +2565,14 @@ with tabs[2]:
                             init_prompt_text,
                             env_type,
                             "skybox",
+                            prop_profile_setting,
+                            allow_inanimate_toys,
                         )
                         init_prompt_debug = prompt_policy.build_skybox_init_prompt(
                             init_prompt_text,
                             env_type,
+                            prop_profile_setting,
+                            allow_inanimate_toys,
                         )
                         if reuse_cache_allowed and cached_init_bytes and init_b64_to_use is None:
                             init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
@@ -2716,18 +2859,26 @@ with tabs[2]:
             location_line, remaining_lines, location_present = _extract_location_line(prompt_lines)
             prompt_text, prompt_negative = _split_prompt_and_negative(" ".join(remaining_lines).strip())
             env_type = resolve_environment_type(prompt_text, environment_type_label)
+            raw_prompt_text = sanitize_environment_prompt(prompt_text, character_names)
+            if neutralize_possessives:
+                raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
+            sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
+            resolved_prop_profile = resolve_prop_profile(sanitized_prompt, prop_profile_setting)
+            if prop_profile_setting == "AUTO":
+                st.write(f"Prop profile resolved (AUTO): {resolved_prop_profile}")
             policy_negative_tokens = _split_negative_tokens(
-                prompt_policy.negative_prompt(env_type)
+                prompt_policy.negative_prompt(
+                    env_type,
+                    sanitized_prompt,
+                    prop_profile_setting,
+                    allow_inanimate_toys,
+                )
             )
             negative_text = _merge_negative_prompts(
                 negative,
                 prompt_negative,
                 ANTI_LETTERBOX_TOKENS + hard_negative_tokens + policy_negative_tokens,
             )
-            raw_prompt_text = sanitize_environment_prompt(prompt_text, character_names)
-            if neutralize_possessives:
-                raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
-            sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
             (
                 sanitized_prompt,
                 negative_text,
@@ -2744,6 +2895,8 @@ with tabs[2]:
                 sanitized_prompt,
                 env_type,
                 "skybox",
+                prop_profile_setting,
+                allow_inanimate_toys,
             )
             blockade_prompt = (
                 _apply_skybox_wrapper(scene_prompt) if apply_skybox_wrapper else scene_prompt
@@ -2781,10 +2934,14 @@ with tabs[2]:
                         init_prompt_text,
                         env_type,
                         "skybox",
+                        prop_profile_setting,
+                        allow_inanimate_toys,
                     )
                     init_prompt_debug = prompt_policy.build_skybox_init_prompt(
                         init_prompt_text,
                         env_type,
+                        prop_profile_setting,
+                        allow_inanimate_toys,
                     )
                     if reuse_cache_allowed and cached_init_bytes and init_b64_to_use is None:
                         init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
