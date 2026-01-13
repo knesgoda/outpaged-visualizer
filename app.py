@@ -1,5 +1,6 @@
 import base64
 import difflib
+import hashlib
 import io
 import json
 import math
@@ -105,6 +106,18 @@ NEGATIVE_INTERIOR = "anachronistic items, sci-fi, plastic, neon, LED"
 NEGATIVE_EXTERIOR = "anachronistic items, sci-fi, plastic, neon, LED"
 
 SKYBOX_HARD_NEGATIVE_DEFAULT = ""
+SKYBOX_FURNITURE_NEGATIVE_TOKENS = [
+    "furniture",
+    "chairs",
+    "tables",
+    "desks",
+    "lamps",
+    "rugs",
+    "beds",
+    "sofas",
+    "pianos",
+    "lots of furniture",
+]
 
 def detect_prop_profile(prompt_text: str) -> str:
     if not prompt_text:
@@ -409,6 +422,12 @@ if "location_cache" not in st.session_state:
     st.session_state["location_cache"] = {}
 if "pending_cache" not in st.session_state:
     st.session_state["pending_cache"] = {"background": {}, "skybox": {}}
+if "skybox_init_candidates" not in st.session_state:
+    st.session_state["skybox_init_candidates"] = []
+if "skybox_init_candidates_hash" not in st.session_state:
+    st.session_state["skybox_init_candidates_hash"] = ""
+if "skybox_selected_init" not in st.session_state:
+    st.session_state["skybox_selected_init"] = None
 
 def _b64_of_uploaded_file(uploaded_file) -> str:
     data = uploaded_file.getvalue()
@@ -742,42 +761,47 @@ def stability_generate_ultra(
         raise RuntimeError(f"Stability Ultra error {resp.status_code}: {resp.text}")
     return resp.content
 
-def make_skybox_init_from_stability(
-    scene_prompt: str,
-    negative_prompt: str,
-    base_seed: int | None,
+def make_skybox_init_candidates_from_stability(
+    prompt: str,
+    negative: str,
+    seed: int | None,
+    num_candidates: int,
+    width: int,
+    height: int,
+    steps: int,
+    cfg_scale: float,
+    *,
     api_key: str,
-    candidates: int = 3,
     make_tileable: bool = True,
     avoid_blurred_poles: bool = True,
     pole_detail_weight: float = POLE_DETAIL_WEIGHT_DEFAULT,
     neutralize_possessives: bool = False,
-) -> tuple[bytes, int | None]:
+) -> list[dict]:
     if neutralize_possessives:
-        scene_prompt = neutralize_character_possessives(scene_prompt)
-    prompt = _build_skybox_init_prompt(scene_prompt)
+        prompt = neutralize_character_possessives(prompt)
+    prompt = _build_skybox_init_prompt(prompt)
 
-    source_aspect = "16:9"
+    if steps or cfg_scale:
+        _ = (steps, cfg_scale)
 
-    best_bytes = None
-    best_seed = None
-    best_score = None
+    source_aspect = _format_aspect_ratio(width, height) or "16:9"
 
-    seed0 = None if (base_seed is None or base_seed <= 0) else int(base_seed)
+    seed0 = None if (seed is None or seed <= 0) else int(seed)
 
-    candidate_count = max(candidates, 5) if avoid_blurred_poles else candidates
+    candidate_count = max(num_candidates, 5) if avoid_blurred_poles else num_candidates
+    candidates: list[dict] = []
     for i in range(candidate_count):
         seed_i = None if seed0 is None else seed0 + i
         raw = stability_generate_ultra(
             prompt=prompt,
-            negative_prompt=negative_prompt,
+            negative_prompt=negative,
             seed=seed_i,
             aspect_ratio=source_aspect,
             api_key=api_key,
         )
         cropped = prepare_skybox_ready_bytes(
             raw,
-            target_size=(2048, 1024),
+            target_size=(width, height),
             make_tileable=False,
         )
         seam_score = edge_seam_score(cropped)
@@ -789,18 +813,54 @@ def make_skybox_init_from_stability(
         if make_tileable:
             fixed = prepare_skybox_ready_bytes(
                 raw,
-                target_size=(2048, 1024),
+                target_size=(width, height),
                 make_tileable=True,
             )
+        candidates.append(
+            {
+                "b64": base64.b64encode(fixed).decode("utf-8"),
+                "seed": seed_i,
+                "score": float(combined_score),
+                "notes": "lower score = better seam/pole quality" if avoid_blurred_poles else None,
+            }
+        )
 
-        if best_score is None or combined_score < best_score:
-            best_score = combined_score
-            best_bytes = fixed
-            best_seed = seed_i
-
-    if best_bytes is None:
+    if not candidates:
         raise RuntimeError("Stability Ultra did not return any images for skybox init.")
-    return best_bytes, best_seed
+    return candidates
+
+def make_skybox_init_from_stability(
+    scene_prompt: str,
+    negative_prompt: str,
+    base_seed: int | None,
+    api_key: str,
+    candidates: int = 3,
+    make_tileable: bool = True,
+    avoid_blurred_poles: bool = True,
+    pole_detail_weight: float = POLE_DETAIL_WEIGHT_DEFAULT,
+    neutralize_possessives: bool = False,
+) -> tuple[bytes, int | None]:
+    init_candidates = make_skybox_init_candidates_from_stability(
+        scene_prompt,
+        negative_prompt,
+        base_seed,
+        candidates,
+        2048,
+        1024,
+        0,
+        0.0,
+        api_key=api_key,
+        make_tileable=make_tileable,
+        avoid_blurred_poles=avoid_blurred_poles,
+        pole_detail_weight=pole_detail_weight,
+        neutralize_possessives=neutralize_possessives,
+    )
+    best_candidate = min(
+        init_candidates,
+        key=lambda item: item.get("score") if item.get("score") is not None else float("inf"),
+    )
+    best_bytes = base64.b64decode(best_candidate["b64"])
+    return best_bytes, best_candidate.get("seed")
 
 def _encode_image_for_upload(image: Image.Image, use_png: bool) -> tuple[bytes, str, str]:
     buffer = io.BytesIO()
@@ -1599,6 +1659,44 @@ def _remove_negative_tokens(negative_text: str, tokens_to_remove: list[str]) -> 
     filtered = [token for token in tokens if token.lower() not in remove_set]
     return ", ".join(filtered)
 
+def _remove_furniture_negatives(negative_text: str) -> str:
+    return _remove_negative_tokens(negative_text, SKYBOX_FURNITURE_NEGATIVE_TOKENS)
+
+def _apply_scene_mode_to_init(
+    prompt_text: str,
+    negative_text: str,
+    scene_mode: str,
+) -> tuple[str, str]:
+    adjusted_prompt = prompt_text
+    adjusted_negative = negative_text
+    if scene_mode == "Empty/abandoned":
+        adjusted_prompt = _append_prompt_tokens(
+            adjusted_prompt,
+            ["unfurnished", "dusty", "cobwebs"],
+        )
+        adjusted_negative = _merge_negative_prompts(
+            adjusted_negative,
+            "",
+            ["clutter", "lots of furniture"],
+        )
+        return adjusted_prompt, adjusted_negative
+    adjusted_negative = _remove_furniture_negatives(adjusted_negative)
+    if scene_mode == "Lived-in interior":
+        adjusted_prompt = _append_prompt_tokens(
+            adjusted_prompt,
+            ["lived-in interior", "furnished", "personal props"],
+        )
+    elif scene_mode == "Exterior":
+        adjusted_prompt = _append_prompt_tokens(
+            adjusted_prompt,
+            ["exterior environment", "open air"],
+        )
+    return adjusted_prompt, adjusted_negative
+
+def _hash_prompt_payload(payload: dict) -> str:
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
 def _banned_term_pattern(term: str) -> str:
     escaped = re.escape(term)
     if not escaped:
@@ -1636,46 +1734,20 @@ def _adjust_skybox_prompts(
 
     if furnishing_mode == "Architecture only":
         furnish_tokens = [
-            "empty",
-            "unfurnished",
             "architecture only",
-            "no loose objects",
-            "no decor props",
             "clean surfaces",
             "uncluttered",
         ]
         adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
         adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
-        furnishing_negatives = [
-            "furniture",
-            "chairs",
-            "tables",
-            "desks",
-            "lamps",
-            "rugs",
-            "beds",
-            "sofas",
-            "pianos",
-            "toys",
-        ]
-        adjusted_negative = _merge_negative_prompts(adjusted_negative, "", furnishing_negatives)
-        adjusted_init_negative = _merge_negative_prompts(
-            adjusted_init_negative,
-            "",
-            furnishing_negatives,
-        )
     elif furnishing_mode == "Sparse essentials":
         furnish_tokens = ["sparse furnishings", "minimal decor", "uncluttered", "clean surfaces"]
         adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
         adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
-        adjusted_negative = _remove_negative_tokens(adjusted_negative, ["furniture"])
-        adjusted_init_negative = _remove_negative_tokens(adjusted_init_negative, ["furniture"])
     else:
         furnish_tokens = ["cozy", "tasteful period furnishings"]
         adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
         adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
-        adjusted_negative = _remove_negative_tokens(adjusted_negative, ["furniture"])
-        adjusted_init_negative = _remove_negative_tokens(adjusted_init_negative, ["furniture"])
 
     if exclude_toys:
         toy_tokens = ["no toys", "no stuffed animals", "no plush", "no dolls", "no mascots"]
@@ -2388,6 +2460,13 @@ with tabs[2]:
             index=0,
             key="skybox_furnishing_mode",
         )
+        scene_mode = st.selectbox(
+            "Scene mode (init prompts only)",
+            ["Lived-in interior", "Empty/abandoned", "Exterior"],
+            index=0,
+            key="skybox_scene_mode",
+            help="Affects only the Stability init plate prompt/negative.",
+        )
         apply_skybox_wrapper = st.checkbox(
             "Apply skybox prompt wrapper",
             value=True,
@@ -2419,6 +2498,26 @@ with tabs[2]:
             key="skybox_seed",
         )
         enhance = st.checkbox("Enhance prompt (Blockade)", value=False, key="skybox_enhance")
+        avoid_character_props = st.checkbox(
+            "Avoid character/toy props",
+            value=False,
+            help="Adds extra negatives to the Stability init plate only.",
+            key="skybox_avoid_character_props",
+        )
+        manual_init_approval = st.checkbox(
+            "Manual approve init plate before Blockade",
+            value=True,
+            key="skybox_manual_init_approval",
+        )
+        init_candidate_count = st.number_input(
+            "Init candidates",
+            min_value=1,
+            max_value=12,
+            value=6,
+            step=1,
+            disabled=not manual_init_approval,
+            key="skybox_init_candidate_count",
+        )
     
         colA, colB = st.columns(2)
         with colA:
@@ -2516,6 +2615,7 @@ with tabs[2]:
                             item.get("negative_prompt", ""),
                             ANTI_LETTERBOX_TOKENS + hard_negative_tokens + policy_negative_tokens,
                         )
+                        negative_text = _remove_furniture_negatives(negative_text)
                         (
                             sanitized_prompt,
                             negative_text,
@@ -2528,6 +2628,26 @@ with tabs[2]:
                             banned_terms,
                             exclude_toys,
                         )
+                        init_negative_text = _remove_furniture_negatives(init_negative_text)
+                        init_prompt_text, init_negative_text = _apply_scene_mode_to_init(
+                            init_prompt_text,
+                            init_negative_text,
+                            scene_mode,
+                        )
+                        if avoid_character_props:
+                            init_negative_text = _merge_negative_prompts(
+                                init_negative_text,
+                                "",
+                                [
+                                    "teddy bear",
+                                    "stuffed animals",
+                                    "plush toys",
+                                    "dolls",
+                                    "character mascots",
+                                    "cameras",
+                                    "photography equipment",
+                                ],
+                            )
                         scene_prompt = prompt_policy.build_prompt(
                             sanitized_prompt,
                             env_type,
@@ -2829,96 +2949,220 @@ with tabs[2]:
                 key="skybox_resolution_id",
             )
     
-        gen_btn = st.button("Generate Skybox", type="primary", use_container_width=True, key="skybox_generate")
-
-        if gen_btn:
-            prompt_policy = PromptPolicy(style_pack_label, era_locale_tags)
-            character_names = extract_character_names(
-                parse_prompt_blocks(
-                    st.session_state.get("character_text", ""),
-                    [
-                        r"character name\s*/\s*file name\s*:\s*(?P<filename>.+)",
-                        r"character file name\s*:\s*(?P<filename>.+)",
-                        r"character filename\s*:\s*(?P<filename>.+)",
-                        r"file name\s*:\s*(?P<filename>.+)",
-                    ],
-                )
+        prompt_policy = PromptPolicy(style_pack_label, era_locale_tags)
+        character_names = extract_character_names(
+            parse_prompt_blocks(
+                st.session_state.get("character_text", ""),
+                [
+                    r"character name\s*/\s*file name\s*:\s*(?P<filename>.+)",
+                    r"character file name\s*:\s*(?P<filename>.+)",
+                    r"character filename\s*:\s*(?P<filename>.+)",
+                    r"file name\s*:\s*(?P<filename>.+)",
+                ],
             )
-            init_b64 = None
-            init_bytes_uploaded = None
-            if init_img:
-                init_bytes_uploaded = prepare_skybox_ready_bytes(
-                    init_img.getvalue(),
-                    target_size=(2048, 1024),
-                    make_tileable=skybox_tileable_blend,
-                )
-                init_b64 = base64.b64encode(init_bytes_uploaded).decode("utf-8")
-            control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
-            skybox_seed = None if seed == 0 else int(seed)
-            prompt_lines = [line.strip() for line in prompt.splitlines() if line.strip()]
-            location_line, remaining_lines, location_present = _extract_location_line(prompt_lines)
-            prompt_text, prompt_negative = _split_prompt_and_negative(" ".join(remaining_lines).strip())
-            env_type = resolve_environment_type(prompt_text, environment_type_label)
-            raw_prompt_text = sanitize_environment_prompt(prompt_text, character_names)
-            if neutralize_possessives:
-                raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
-            sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
-            resolved_prop_profile = resolve_prop_profile(sanitized_prompt, prop_profile_setting)
-            if prop_profile_setting == "AUTO":
-                st.write(f"Prop profile resolved (AUTO): {resolved_prop_profile}")
-            policy_negative_tokens = _split_negative_tokens(
-                prompt_policy.negative_prompt(
-                    env_type,
-                    sanitized_prompt,
-                    prop_profile_setting,
-                    allow_inanimate_toys,
-                )
+        )
+        init_b64 = None
+        init_bytes_uploaded = None
+        if init_img:
+            init_bytes_uploaded = prepare_skybox_ready_bytes(
+                init_img.getvalue(),
+                target_size=(2048, 1024),
+                make_tileable=skybox_tileable_blend,
             )
-            negative_text = _merge_negative_prompts(
-                negative,
-                prompt_negative,
-                ANTI_LETTERBOX_TOKENS + hard_negative_tokens + policy_negative_tokens,
-            )
-            (
-                sanitized_prompt,
-                negative_text,
-                init_prompt_text,
-                init_negative_text,
-            ) = _adjust_skybox_prompts(
-                sanitized_prompt,
-                negative_text,
-                furnishing_mode,
-                banned_terms,
-                exclude_toys,
-            )
-            scene_prompt = prompt_policy.build_prompt(
-                sanitized_prompt,
+            init_b64 = base64.b64encode(init_bytes_uploaded).decode("utf-8")
+        control_b64 = _b64_of_uploaded_file(control_img) if control_img else None
+        skybox_seed = None if seed == 0 else int(seed)
+        prompt_lines = [line.strip() for line in prompt.splitlines() if line.strip()]
+        location_line, remaining_lines, location_present = _extract_location_line(prompt_lines)
+        prompt_text, prompt_negative = _split_prompt_and_negative(" ".join(remaining_lines).strip())
+        env_type = resolve_environment_type(prompt_text, environment_type_label)
+        raw_prompt_text = sanitize_environment_prompt(prompt_text, character_names)
+        if neutralize_possessives:
+            raw_prompt_text = neutralize_character_possessives(raw_prompt_text)
+        sanitized_prompt = sanitize_skybox_prompt(raw_prompt_text)
+        resolved_prop_profile = resolve_prop_profile(sanitized_prompt, prop_profile_setting)
+        policy_negative_tokens = _split_negative_tokens(
+            prompt_policy.negative_prompt(
                 env_type,
-                "skybox",
+                sanitized_prompt,
                 prop_profile_setting,
                 allow_inanimate_toys,
             )
-            blockade_prompt = (
-                _apply_skybox_wrapper(scene_prompt) if apply_skybox_wrapper else scene_prompt
+        )
+        negative_text = _merge_negative_prompts(
+            negative,
+            prompt_negative,
+            ANTI_LETTERBOX_TOKENS + hard_negative_tokens + policy_negative_tokens,
+        )
+        negative_text = _remove_furniture_negatives(negative_text)
+        (
+            sanitized_prompt,
+            negative_text,
+            init_prompt_text,
+            init_negative_text,
+        ) = _adjust_skybox_prompts(
+            sanitized_prompt,
+            negative_text,
+            furnishing_mode,
+            banned_terms,
+            exclude_toys,
+        )
+        init_negative_text = _remove_furniture_negatives(init_negative_text)
+        init_prompt_text, init_negative_text = _apply_scene_mode_to_init(
+            init_prompt_text,
+            init_negative_text,
+            scene_mode,
+        )
+        if avoid_character_props:
+            init_negative_text = _merge_negative_prompts(
+                init_negative_text,
+                "",
+                [
+                    "teddy bear",
+                    "stuffed animals",
+                    "plush toys",
+                    "dolls",
+                    "character mascots",
+                    "cameras",
+                    "photography equipment",
+                ],
             )
-            location_text = _resolve_location(location_line)
-            location_key = ""
-            skybox_cache = st.session_state["skybox_cache"]
-            cached_entry = None
-            similarity = 0.0
-            cache_mode = cache_mode_label
-            reuse_cache_allowed = reuse_location_cache and cache_mode_allows_reuse(cache_mode)
-            if reuse_cache_allowed and location_reuse_enabled and location_present and location_text:
-                location_key = normalize_location(location_text)
-                _, cached_entry, similarity = find_similar_location(
-                    location_key,
-                    skybox_cache,
+        scene_prompt = prompt_policy.build_prompt(
+            sanitized_prompt,
+            env_type,
+            "skybox",
+            prop_profile_setting,
+            allow_inanimate_toys,
+        )
+        blockade_prompt = _apply_skybox_wrapper(scene_prompt) if apply_skybox_wrapper else scene_prompt
+        init_scene_prompt = prompt_policy.build_prompt(
+            init_prompt_text,
+            env_type,
+            "skybox",
+            prop_profile_setting,
+            allow_inanimate_toys,
+        )
+        init_prompt_debug = prompt_policy.build_skybox_init_prompt(
+            init_prompt_text,
+            env_type,
+            prop_profile_setting,
+            allow_inanimate_toys,
+        )
+        location_text = _resolve_location(location_line)
+        location_key = ""
+        skybox_cache = st.session_state["skybox_cache"]
+        cached_entry = None
+        similarity = 0.0
+        cache_mode = cache_mode_label
+        reuse_cache_allowed = reuse_location_cache and cache_mode_allows_reuse(cache_mode)
+        if reuse_cache_allowed and location_reuse_enabled and location_present and location_text:
+            location_key = normalize_location(location_text)
+            _, cached_entry, similarity = find_similar_location(
+                location_key,
+                skybox_cache,
+            )
+        cached_init_bytes = None
+        cached_seed = None
+        if cached_entry:
+            cached_init_bytes = cached_entry.get("image_bytes")
+            cached_seed = cached_entry.get("seed")
+
+        current_init_hash = _hash_prompt_payload(
+            {
+                "prompt": init_scene_prompt,
+                "negative": init_negative_text,
+                "seed": skybox_seed,
+                "scene_mode": scene_mode,
+                "avoid_character_props": avoid_character_props,
+            }
+        )
+        if st.session_state.get("skybox_init_candidates_hash") != current_init_hash:
+            st.session_state["skybox_init_candidates"] = []
+            st.session_state["skybox_selected_init"] = None
+            st.session_state["skybox_init_candidates_hash"] = current_init_hash
+
+        if manual_init_approval and init_b64 is None:
+            generate_candidates = st.button(
+                "Generate init candidates",
+                type="secondary",
+                use_container_width=True,
+                key="skybox_generate_init_candidates",
+            )
+            if generate_candidates:
+                stability_key = stability_api_key()
+                candidates = make_skybox_init_candidates_from_stability(
+                    init_scene_prompt,
+                    init_negative_text,
+                    skybox_seed,
+                    int(init_candidate_count),
+                    2048,
+                    1024,
+                    0,
+                    0.0,
+                    api_key=stability_key,
+                    make_tileable=skybox_tileable_blend,
+                    avoid_blurred_poles=avoid_blurred_poles,
+                    pole_detail_weight=pole_detail_weight,
+                    neutralize_possessives=neutralize_possessives,
                 )
-            cached_init_bytes = None
-            cached_seed = None
-            if cached_entry:
-                cached_init_bytes = cached_entry.get("image_bytes")
-                cached_seed = cached_entry.get("seed")
+                st.session_state["skybox_init_candidates"] = candidates
+                st.session_state["skybox_init_candidates_hash"] = current_init_hash
+
+            candidates = st.session_state.get("skybox_init_candidates", [])
+            if candidates:
+                st.markdown("**Init plate candidates**")
+                columns = st.columns(3)
+                for idx, candidate in enumerate(candidates):
+                    with columns[idx % 3]:
+                        st.image(
+                            base64.b64decode(candidate["b64"]),
+                            use_container_width=True,
+                            caption=(
+                                f"Seed {candidate.get('seed')} • "
+                                f"Score {candidate.get('score'):.3f}"
+                                if candidate.get("score") is not None
+                                else f"Seed {candidate.get('seed')}"
+                            ),
+                        )
+                        if st.button(
+                            "Use this init",
+                            key=f"skybox_use_init_{idx}",
+                            use_container_width=True,
+                        ):
+                            st.session_state["skybox_selected_init"] = {
+                                "b64": candidate["b64"],
+                                "seed": candidate.get("seed"),
+                                "prompt_hash": current_init_hash,
+                            }
+
+        selected_init = st.session_state.get("skybox_selected_init")
+        selected_init_valid = (
+            selected_init
+            and selected_init.get("prompt_hash") == current_init_hash
+            and selected_init.get("b64")
+        )
+        if selected_init_valid:
+            st.markdown("**Selected init plate**")
+            st.image(
+                base64.b64decode(selected_init["b64"]),
+                caption=f"Selected seed: {selected_init.get('seed')}",
+                use_container_width=True,
+            )
+
+        gen_disabled = bool(
+            manual_init_approval and init_b64 is None and not selected_init_valid
+        )
+        gen_btn = st.button(
+            "Generate Skybox",
+            type="primary",
+            use_container_width=True,
+            key="skybox_generate",
+            disabled=gen_disabled,
+        )
+
+        if gen_btn:
+            if prop_profile_setting == "AUTO":
+                st.write(f"Prop profile resolved (AUTO): {resolved_prop_profile}")
 
             with st.status("Generating skybox…", expanded=True) as status:
                 try:
@@ -2930,19 +3174,9 @@ with tabs[2]:
                     init_bytes_generated = None
                     init_b64_to_use = init_b64
                     reused_init = False
-                    init_scene_prompt = prompt_policy.build_prompt(
-                        init_prompt_text,
-                        env_type,
-                        "skybox",
-                        prop_profile_setting,
-                        allow_inanimate_toys,
-                    )
-                    init_prompt_debug = prompt_policy.build_skybox_init_prompt(
-                        init_prompt_text,
-                        env_type,
-                        prop_profile_setting,
-                        allow_inanimate_toys,
-                    )
+                    if manual_init_approval and init_b64_to_use is None and selected_init_valid:
+                        init_b64_to_use = selected_init["b64"]
+                        status.write("Using manually selected init plate.")
                     if reuse_cache_allowed and cached_init_bytes and init_b64_to_use is None:
                         init_b64_to_use = base64.b64encode(cached_init_bytes).decode("utf-8")
                         reused_init = True
@@ -2977,6 +3211,11 @@ with tabs[2]:
                         status.write(f"Stability init negative (cached): {init_negative_text}")
                         status.write(f"Stability init seed used (cached): {cached_seed}")
                         status.write("Stability init cache reused: True")
+                    elif manual_init_approval and selected_init_valid:
+                        status.write(f"Stability init prompt (manual): {init_prompt_debug}")
+                        status.write(f"Stability init negative (manual): {init_negative_text}")
+                        status.write(f"Stability init seed used (manual): {selected_init.get('seed')}")
+                        status.write("Stability init cache reused: False")
                     else:
                         status.write(f"Stability init prompt (provided): {init_prompt_debug}")
                         status.write(f"Stability init negative (provided): {init_negative_text}")
