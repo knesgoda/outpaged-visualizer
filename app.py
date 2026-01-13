@@ -1292,9 +1292,15 @@ def read_docx_text(uploaded_file) -> str:
 
 def _sanitize_prompt_text(text: str) -> str:
     cleaned = re.sub(
-        r"\bstreetview,\s*viewer standing at the\b",
+        r"^\s*(?:skybox\s*prompt|background\s*prompt|prompt)\s*:\s*",
         "",
         text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\bstreetview,\s*viewer standing at the\b",
+        "",
+        cleaned,
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(
@@ -1643,6 +1649,8 @@ def parse_prompt_blocks(text: str, label_patterns: list[str]) -> list[dict]:
                     }
                 )
             current_name = match.group("filename").strip()
+            if re.fullmatch(r"\d+", current_name):
+                current_name = f"ch{int(current_name):02d}bg01"
             current_lines = []
         elif current_name:
             current_lines.append(line)
@@ -1940,7 +1948,10 @@ with tabs[0]:
 
     bg_items = parse_prompt_blocks(
         bg_text,
-        [r"background file name\s*:\s*(?P<filename>.+)"],
+        [
+            r"background file name\s*:\s*(?P<filename>.+)",
+            r"scene\s*(?P<filename>\d+)\b",
+        ],
     )
     st.write(f"Parsed backgrounds: {len(bg_items)}")
     if bg_items:
@@ -1962,7 +1973,11 @@ with tabs[0]:
             hide_index=True,
         )
     else:
-        st.info("No background entries parsed yet. Ensure your DOCX includes 'Background file name: <name>'.")
+        st.info(
+            "No background entries parsed yet. Ensure your DOCX includes "
+            "'Background file name: <name>' or a 'Scene 01 ...' header "
+            "(scene headers derive filenames automatically)."
+        )
 
     bg_negative = st.text_input(
         "Negative prompt (optional overrides)",
@@ -2532,6 +2547,7 @@ with tabs[2]:
                 r"skybox file name\s*:\s*(?P<filename>.+)",
                 r"skybox filename\s*:\s*(?P<filename>.+)",
                 r"file name\s*:\s*(?P<filename>.+)",
+                r"scene\s*(?P<filename>\d+)\b",
             ],
         )
         st.write(f"Parsed skyboxes: {len(skybox_items)}")
