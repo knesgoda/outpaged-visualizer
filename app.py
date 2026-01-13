@@ -347,6 +347,15 @@ with st.sidebar:
         key="panoramic_style",
     )
     panoramic_style = PADDING_STYLE_OPTIONS[panoramic_style_label]
+    st.header("Stability settings")
+    stability_steps = st.slider(
+        "Sampling steps",
+        min_value=10,
+        max_value=80,
+        value=50,
+        step=1,
+        key="stability_sampling_steps",
+    )
     st.header("Prompt policy")
     style_pack_label = st.selectbox(
         "Style pack",
@@ -725,6 +734,7 @@ def stability_generate_images(
     api_key: str,
     init_image_bytes: bytes | None = None,
     init_strength: float | None = None,
+    steps: int | None = None,
 ):
     payload = {
         "prompt": prompt,
@@ -735,6 +745,8 @@ def stability_generate_images(
     }
     if seed is not None:
         payload["seed"] = int(seed)
+    if steps is not None:
+        payload["steps"] = int(steps)
     if init_image_bytes is not None and init_strength is not None:
         payload["strength"] = str(init_strength)
 
@@ -2130,6 +2142,7 @@ with tabs[0]:
                         api_key=stability_key,
                         init_image_bytes=init_bytes_to_use,
                         init_strength=bg_strength if init_bytes_to_use else None,
+                        steps=stability_steps,
                     )
                     status.write(f"Provider used: {provider_label}")
                     seed_used = seed_to_use if provider_label == "Stability.ai" else None
@@ -2418,6 +2431,7 @@ with tabs[1]:
                             api_key=stability_key,
                             init_image_bytes=init_bytes_to_use,
                             init_strength=char_strength if init_bytes_to_use else None,
+                            steps=stability_steps,
                         )
                         status.write(f"Provider used: {provider_label}")
                         seed_used = seed_to_use if provider_label == "Stability.ai" else None
