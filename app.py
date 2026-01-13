@@ -54,7 +54,7 @@ ANTI_LETTERBOX_TOKENS = [
 ]
 
 SKYBOX_PROMPT_WRAPPER_TOKENS = [
-    "full 360° equirectangular panorama (2:1)",
+    "equirectangular 360 panorama, 2:1 aspect ratio",
     "detailed zenith (ceiling) and nadir (floor)",
     "no smeared/blurred poles",
     "no vignetting",
@@ -84,11 +84,11 @@ EMPTY_ENVIRONMENT_GUARDRAILS = (
 )
 
 ALWAYS_NEGATIVE = """
-people, person, faces, bodies, hands, crowds, silhouettes, distant figures, tiny people,
-text, letters, typography, signage, watermark, logo, UI,
-modern electronics, screens, TV, laptop, phone, cables, wires,
-cameras, photography equipment, camera rigs, tripods, microphones, film gear,
-vehicles, cars, planes, boats,
+people, person, human, man, woman, child, face, head, hands, body, limbs, silhouette, crowd, tourists,
+text, letters, typography, signage, watermark, watermarks, logo, UI, interface, subtitles,
+modern, contemporary, plastic, electronics, screen, phone, laptop, TV,
+street sign, power lines, vehicles, cars, backpacks, cameras, sneakers, modern clothing,
+cables, wires, camera rigs, tripods, microphones, film gear,
 blurry, low-res, jpeg artifacts, deformed, distorted, oversaturated, uncanny
 """.strip()
 
@@ -103,21 +103,46 @@ TOYS_NEGATIVE = "plush toys, teddy bears, dolls, figurines, action figures"
 EMPTY_PROPS_NEGATIVE = "furniture, clutter, props, decorations, books, toys, rugs, curtains, plants"
 
 NEGATIVE_INTERIOR = "anachronistic items, sci-fi, plastic, neon, LED"
-NEGATIVE_EXTERIOR = "anachronistic items, sci-fi, plastic, neon, LED"
+NEGATIVE_EXTERIOR = (
+    "anachronistic items, sci-fi, plastic, neon, LED, modern street signs, billboards, "
+    "traffic lights, asphalt roads, parking lots, power lines"
+)
 
 SKYBOX_HARD_NEGATIVE_DEFAULT = ""
 SKYBOX_FURNITURE_NEGATIVE_TOKENS = [
     "furniture",
+    "placeable props",
+    "props",
+    "decorations",
+    "books",
+    "toys",
+    "houseplants",
+    "plants",
+    "rugs",
+    "curtains",
     "chairs",
     "tables",
     "desks",
     "lamps",
-    "rugs",
     "beds",
     "sofas",
     "pianos",
     "lots of furniture",
 ]
+
+SET_DRESSING_OPTIONS = {
+    "Scene-accurate": "scene_accurate",
+    "Sparse": "sparse",
+    "Empty": "empty",
+    "Abandoned": "abandoned",
+}
+
+SET_DRESSING_SUGGEST_KEYWORDS = {
+    "empty": "Empty",
+    "unfurnished": "Empty",
+    "abandoned": "Abandoned",
+    "deserted": "Abandoned",
+}
 
 def detect_prop_profile(prompt_text: str) -> str:
     if not prompt_text:
@@ -144,6 +169,26 @@ def resolve_prop_profile(prompt_text: str, prop_profile: str) -> str:
     if profile in {"EMPTY", "SPARSE", "LIVED_IN"}:
         return profile
     return "SPARSE"
+
+def normalize_set_dressing_mode(mode: str) -> str:
+    if not mode:
+        return "scene_accurate"
+    mode_clean = mode.strip().lower().replace("-", "_").replace(" ", "_")
+    for label, value in SET_DRESSING_OPTIONS.items():
+        if mode_clean == value:
+            return value
+        if mode_clean == label.lower().replace("-", "_").replace(" ", "_"):
+            return value
+    return "scene_accurate"
+
+def suggest_set_dressing_mode(scene_text: str) -> str | None:
+    if not scene_text:
+        return None
+    lowered = scene_text.lower()
+    for keyword, suggestion in SET_DRESSING_SUGGEST_KEYWORDS.items():
+        if keyword in lowered:
+            return suggestion
+    return None
 
 def build_negative(env_type: str, prop_profile: str, allow_inanimate_toys: bool) -> str:
     env = env_type.lower()
@@ -204,12 +249,12 @@ class PromptPolicy:
         if output == "skybox":
             if env == "exterior":
                 return (
-                    "full 360° equirectangular panorama (2:1), ground view, eye level, "
+                    "equirectangular 360 panorama, 2:1 aspect ratio, ground view, eye level, "
                     "wide panoramic environment plate, horizon stable, evenly distributed detail, "
                     "no close foreground occluders"
                 )
             return (
-                "full 360° equirectangular panorama (2:1), ground view, eye level, "
+                "equirectangular 360 panorama, 2:1 aspect ratio, ground view, eye level, "
                 "wide-angle interior environment plate, camera centered in the room, "
                 "continuous walls and ceiling, natural perspective, soft depth, "
                 "no close foreground occluders"
@@ -1680,7 +1725,6 @@ def _apply_scene_mode_to_init(
             ["clutter", "lots of furniture"],
         )
         return adjusted_prompt, adjusted_negative
-    adjusted_negative = _remove_furniture_negatives(adjusted_negative)
     if scene_mode == "Lived-in interior":
         adjusted_prompt = _append_prompt_tokens(
             adjusted_prompt,
@@ -1719,10 +1763,13 @@ def _strip_banned_terms(text: str, banned_terms: list[str]) -> str:
     cleaned = re.sub(r",\s*,", ", ", cleaned)
     return cleaned.strip(" ,;-")
 
+def _mark_set_dressing_manual() -> None:
+    st.session_state["skybox_set_dressing_manual"] = True
+
 def _adjust_skybox_prompts(
     prompt_text: str,
     negative_text: str,
-    furnishing_mode: str,
+    set_dressing_mode: str,
     banned_terms: list[str],
     exclude_toys: bool,
 ) -> tuple[str, str, str, str]:
@@ -1732,22 +1779,92 @@ def _adjust_skybox_prompts(
     adjusted_negative = negative_text
     adjusted_init_negative = negative_text
 
-    if furnishing_mode == "Architecture only":
+    set_dressing = normalize_set_dressing_mode(set_dressing_mode)
+    prop_control_negatives = [
+        "floating object",
+        "isolated object",
+        "hero object",
+        "centered object",
+        "oversized object",
+        "random foreground object",
+    ]
+    if set_dressing == "scene_accurate":
+        adjusted_negative = _remove_furniture_negatives(adjusted_negative)
+        adjusted_init_negative = _remove_furniture_negatives(adjusted_init_negative)
+        adjusted_negative = _merge_negative_prompts(adjusted_negative, "", prop_control_negatives)
+        adjusted_init_negative = _merge_negative_prompts(
+            adjusted_init_negative,
+            "",
+            prop_control_negatives,
+        )
+    elif set_dressing == "sparse":
+        furnish_tokens = ["sparse", "minimal furnishings", "uncluttered", "clean composition"]
+        adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
+        adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
+        adjusted_negative = _remove_furniture_negatives(adjusted_negative)
+        adjusted_init_negative = _remove_furniture_negatives(adjusted_init_negative)
+        adjusted_negative = _merge_negative_prompts(
+            adjusted_negative,
+            "",
+            ["no clutter", "no mess", "no piles"] + prop_control_negatives,
+        )
+        adjusted_init_negative = _merge_negative_prompts(
+            adjusted_init_negative,
+            "",
+            ["no clutter", "no mess", "no piles"] + prop_control_negatives,
+        )
+    elif set_dressing == "empty":
+        furnish_tokens = ["unfurnished", "empty room", "bare floorboards", "open space"]
+        adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
+        adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
+        adjusted_negative = _merge_negative_prompts(
+            adjusted_negative,
+            "",
+            ["furniture", "toys", "decorations", "houseplants", "extra objects", "clutter"],
+        )
+        adjusted_init_negative = _merge_negative_prompts(
+            adjusted_init_negative,
+            "",
+            ["furniture", "toys", "decorations", "houseplants", "extra objects", "clutter"],
+        )
+    elif set_dressing == "abandoned":
         furnish_tokens = [
-            "architecture only",
-            "clean surfaces",
-            "uncluttered",
+            "unfurnished",
+            "empty room",
+            "bare floorboards",
+            "open space",
+            "dust motes in sunlight",
+            "cobwebs in corners",
+            "slight decay",
         ]
         adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
         adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
-    elif furnishing_mode == "Sparse essentials":
-        furnish_tokens = ["sparse furnishings", "minimal decor", "uncluttered", "clean surfaces"]
-        adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
-        adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
-    else:
-        furnish_tokens = ["cozy", "tasteful period furnishings"]
-        adjusted_prompt = _append_prompt_tokens(adjusted_prompt, furnish_tokens)
-        adjusted_init = _append_prompt_tokens(adjusted_init, furnish_tokens)
+        adjusted_negative = _merge_negative_prompts(
+            adjusted_negative,
+            "",
+            [
+                "furniture",
+                "toys",
+                "decorations",
+                "houseplants",
+                "extra objects",
+                "clutter",
+                "modern debris",
+            ],
+        )
+        adjusted_init_negative = _merge_negative_prompts(
+            adjusted_init_negative,
+            "",
+            [
+                "furniture",
+                "toys",
+                "decorations",
+                "houseplants",
+                "extra objects",
+                "clutter",
+                "modern debris",
+            ],
+        )
 
     if exclude_toys:
         toy_tokens = ["no toys", "no stuffed animals", "no plush", "no dolls", "no mascots"]
@@ -2454,12 +2571,23 @@ with tabs[2]:
             "3D watercolor diorama",
             key="skybox_prompt",
         )
-        furnishing_mode = st.selectbox(
-            "Furnishing mode",
-            ["Architecture only", "Sparse essentials", "Cozy furnished"],
+        if "skybox_set_dressing_manual" not in st.session_state:
+            st.session_state["skybox_set_dressing_manual"] = False
+        if "skybox_set_dressing_mode" not in st.session_state:
+            st.session_state["skybox_set_dressing_mode"] = "Scene-accurate"
+        suggested_set_dressing = suggest_set_dressing_mode(prompt)
+        if suggested_set_dressing and not st.session_state["skybox_set_dressing_manual"]:
+            st.session_state["skybox_set_dressing_mode"] = suggested_set_dressing
+        if suggested_set_dressing:
+            st.caption(f"Set dressing suggestion: {suggested_set_dressing}.")
+        set_dressing_label = st.selectbox(
+            "Set dressing mode",
+            list(SET_DRESSING_OPTIONS.keys()),
             index=0,
-            key="skybox_furnishing_mode",
+            key="skybox_set_dressing_mode",
+            on_change=_mark_set_dressing_manual,
         )
+        set_dressing_mode = SET_DRESSING_OPTIONS[set_dressing_label]
         scene_mode = st.selectbox(
             "Scene mode (init prompts only)",
             ["Lived-in interior", "Empty/abandoned", "Exterior"],
@@ -2615,7 +2743,6 @@ with tabs[2]:
                             item.get("negative_prompt", ""),
                             ANTI_LETTERBOX_TOKENS + hard_negative_tokens + policy_negative_tokens,
                         )
-                        negative_text = _remove_furniture_negatives(negative_text)
                         (
                             sanitized_prompt,
                             negative_text,
@@ -2624,11 +2751,10 @@ with tabs[2]:
                         ) = _adjust_skybox_prompts(
                             sanitized_prompt,
                             negative_text,
-                            furnishing_mode,
+                            set_dressing_mode,
                             banned_terms,
                             exclude_toys,
                         )
-                        init_negative_text = _remove_furniture_negatives(init_negative_text)
                         init_prompt_text, init_negative_text = _apply_scene_mode_to_init(
                             init_prompt_text,
                             init_negative_text,
@@ -2994,7 +3120,6 @@ with tabs[2]:
             prompt_negative,
             ANTI_LETTERBOX_TOKENS + hard_negative_tokens + policy_negative_tokens,
         )
-        negative_text = _remove_furniture_negatives(negative_text)
         (
             sanitized_prompt,
             negative_text,
@@ -3003,11 +3128,10 @@ with tabs[2]:
         ) = _adjust_skybox_prompts(
             sanitized_prompt,
             negative_text,
-            furnishing_mode,
+            set_dressing_mode,
             banned_terms,
             exclude_toys,
         )
-        init_negative_text = _remove_furniture_negatives(init_negative_text)
         init_prompt_text, init_negative_text = _apply_scene_mode_to_init(
             init_prompt_text,
             init_negative_text,
